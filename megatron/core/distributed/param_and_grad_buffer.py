@@ -350,6 +350,7 @@ class _ParamAndGradBucketGroup:
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for bucket in self.buckets:
+                print(f"use_distributed_optimizer : {self.ddp_config.use_distributed_optimizer}")
                 if self.ddp_config.use_distributed_optimizer:
                     local_data_view = shard_buffer(
                         bucket.grad_data, self.intra_distributed_optimizer_instance_size
