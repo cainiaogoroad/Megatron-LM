@@ -36,6 +36,8 @@ from . import wandb_utils
 
 from . import ft_integration
 
+from vtimeline import VLogger, TracePoint
+
 # [ModelOpt]: Import
 try:
     from modelopt.torch.opt.plugins import (
@@ -320,11 +322,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     Dataloader checkpoint is only saved if the dataloader supports it. Currently this applies only
     to the Megatron Energon dataloader (multimodal) and not the built-in Megatron dataloader (text-only).
     """
+    prepare_tp = TracePoint("prepare-state-dict", "CKPT")
+    prepare_tp.begin()
+
     start_ckpt = time()
     args = get_args()
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
+        VLogger.warn("WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.")
 
     # Prepare E2E metrics at start of save checkpoint
     productive_metrics = on_save_checkpoint_start(args.async_save)
@@ -360,6 +366,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
         iteration, save_dir, ckpt_format))
+    VLogger.info('saving checkpoint at iteration {} to {} in {} format {} type.'.format(
+        iteration, save_dir, ckpt_format, ckpt_type.name))
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state(args.ckpt_format)
@@ -450,6 +458,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
             end_ckpt = time()
+            prepare_tp.end()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save,
@@ -477,6 +486,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
+            prepare_tp.end()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             if ckpt_type == CheckpointType.LOCAL:
                 try:
@@ -519,6 +529,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             def iter_finalize_fn():
                 print_rank_0('  successfully saved local checkpoint from iteration {:7d}'
                              .format(iteration))
+                VLogger.info("successfully saved local checkpoint from iteration {:7d}".format(iteration))
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async local checkpoint\tIteration: {iteration}',
                                            barrier=False)
@@ -527,6 +538,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 with open(tracker_filename, 'w') as f:
                     f.write(str(iteration))
                 print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
+                             f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
+                             f'p {(pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1}/{mpu.get_pipeline_model_parallel_world_size()} ]')
+                VLogger.info(f'successfully saved checkpoint from iteration {int(iteration)} to {args.save} '
                              f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
                              f'p {(pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1}/{mpu.get_pipeline_model_parallel_world_size()} ]')
                 if args.log_progress and args.async_save:
@@ -565,6 +579,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     if args.async_save:
         schedule_async_save(async_save_request)
+        VLogger.info("scheduled an async checkpoint save task at iteration {}.".format(iteration))
+
         print_rank_0('  scheduled an async checkpoint save at iteration {:7d} to {}' \
                      .format(iteration, save_dir))
 
@@ -833,8 +849,12 @@ def _load_global_dist_base_checkpoint(
 ):
     """ Load the base state_dict from the given directory containing the global distributed checkpoint """
     if rank0:
+        tp = TracePoint("load-common-state", "CKPT")
+        tp.begin()
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
+        tp.end()
+        VLogger.info("load common state from checkpoint {} done".format(checkpoint_name))
         return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
     if sharded_state_dict is None:
@@ -846,6 +866,8 @@ def _load_global_dist_base_checkpoint(
             'Detected load from a distributed checkpoint, but neither --use-dist-ckpt nor --auto-detect-ckpt-format is set.'
         )
 
+    tp = TracePoint("load-dist-checkpoint", "CKPT")
+    tp.begin()
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
     load_strategy = get_default_load_sharded_strategy(checkpoint_name)
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
@@ -856,6 +878,7 @@ def _load_global_dist_base_checkpoint(
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
     state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
+    tp.end()
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 

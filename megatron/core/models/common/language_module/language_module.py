@@ -19,6 +19,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
+from vtimeline import TracePoint
+
 
 class LanguageModule(MegatronModule):
     """Base language module that has common helper functions used across GPT, BERT etc.
@@ -78,6 +80,8 @@ class LanguageModule(MegatronModule):
         Returns:
             Tensor: Loss tensor of dimensions [batch size, sequence_length]
         """
+        tp = TracePoint("ComputeLoss", "Model", stream=torch.cuda.current_stream())
+        tp.begin()
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         if self.config.cross_entropy_loss_fusion:
@@ -98,6 +102,7 @@ class LanguageModule(MegatronModule):
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
+        tp.end()
         return loss
 
     def setup_embeddings_and_output_layer(self) -> None:

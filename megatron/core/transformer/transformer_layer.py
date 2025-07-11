@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed
 from torch import Tensor
+from vtimeline import TracePoint
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -386,8 +387,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+        with TracePoint("AttnFwd", "Model", torch.cuda.current_stream(), level="INFO"):
+            pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
+        with TracePoint("MlpFwd", "Model", level="INFO"):
+            output = self._forward_mlp(pre_mlp_layernorm_output, residual)
         return output, context
 
     def _forward_attention(

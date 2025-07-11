@@ -111,6 +111,8 @@ from . import one_logger_utils
 
 from . import ft_integration
 
+from vtimeline import VLogger, TracePoint, MemRecorder, CUPTI, MetricRecorder
+
 stimer = StragglerDetector()
 
 
@@ -754,8 +756,10 @@ def pretrain(
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(
-        barrier=True)
+    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+
+    tp = TracePoint("build_dateiters", "Train")
+    tp.begin()
     if args.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
@@ -771,6 +775,8 @@ def pretrain(
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
+    tp.end()
+
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -808,10 +814,13 @@ def pretrain(
         print_datetime('after training is done')
 
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
+            tp = TracePoint("save-checkpoint", "Train")
+            tp.begin()
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                             num_floating_point_operations_so_far, checkpointing_context,
                             train_data_iterator=train_data_iterator,
                             preprocess_common_state_dict_fn=preprocess_common_state_dict)
+            tp.end()
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -935,11 +944,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 )
             model.model_type = model_type
         return model
+
+    tp = TracePoint("build-model", "Train")
+    tp.begin()
+    MemRecorder.record()
     if args.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
     else:
         model = build_model()
+    MemRecorder.record()
+    tp.end()
 
     if not isinstance(model, list):
         model = [model]
@@ -958,23 +973,37 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
          for model_module in model]
     )
     if mpu.get_data_parallel_rank() == 0:
-        print(' > number of parameters on (tensor, pipeline) '
-              'model parallel rank ({}, {}): {}'.format(
-            mpu.get_tensor_model_parallel_rank(),
-            mpu.get_pipeline_model_parallel_rank(),
-            num_parameters), flush=True)
+        print(
+            ' > number of parameters on (tensor, pipeline) '
+            'model parallel rank ({}, {}): {}'.format(
+                mpu.get_tensor_model_parallel_rank(),
+                mpu.get_pipeline_model_parallel_rank(),
+                num_parameters,
+            ),
+            flush=True,
+        )
 
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
+    tp = TracePoint("gpu-allocation", "Train")
+    tp.begin()
+    MemRecorder.record()
     if not (args.use_torch_fsdp2 and args.use_cpu_initialization) and not args.init_model_with_meta_device:
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
+    MemRecorder.record()
+    tp.end()
 
     # Fp16 conversion.
+    tp = TracePoint("fp16-bf16-conversion", "Train")
+    tp.begin()
+    MemRecorder.record()
     if args.fp16 or args.bf16:
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
+    MemRecorder.record()
+    tp.end()
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
@@ -984,6 +1013,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
+        tp = TracePoint("warp-ddp", "Train")
+        tp.begin()
+        MemRecorder.record()
         if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
@@ -1042,6 +1074,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if args.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
+        MemRecorder.record()
+        tp.end()
 
     return model
 
@@ -1162,9 +1196,20 @@ def setup_model_and_optimizer(model_provider_func,
         })
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
+        tp = TracePoint("load-checkpoint-in-model-setup", "Train")
+        tp.begin()
+        MemRecorder.record()
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False) and args.ckpt_format == "torch_dist")
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context=checkpointing_context,
+            skip_load_to_model_and_opt=HAVE_FSDP2
+            and getattr(args, "use_torch_fsdp2", False)
+            and args.ckpt_format == "torch_dist",
+        )
+        MemRecorder.record()
+        tp.end()
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -1263,7 +1308,10 @@ def train_step(forward_step_func, data_iterator,
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    optimizer_tp = TracePoint("optimizer-step", "Train")
+    optimizer_tp.begin()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    optimizer_tp.end()
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -1540,6 +1588,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        MetricRecorder.record_rank0("MFU", throughput)
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
@@ -1946,6 +1995,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Run training iterations till done.
     while iteration < args.train_iters:
+        MemRecorder.record()
+        CUPTI.step()
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
                 prof.step()
@@ -1988,6 +2039,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Run training step.
         args.curr_iteration = iteration
+        tp = TracePoint(f"train-step-it-{iteration}", "Train", level="INFO")
+        tp.begin()
         ft_integration.on_training_step_start()
         loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
@@ -1997,6 +2050,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        opt_param_scheduler,
                        config)
         ft_integration.on_training_step_end()
+        tp.end()
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
@@ -2353,6 +2407,10 @@ def build_train_valid_test_data_loaders(
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
+
+    VLogger.info_rank0("build train-valid-test dataset: iteration {}, consumed train samples {}, consumed valid samples {}.".format(
+        args.iteration, args.consumed_train_samples, args.consumed_valid_samples
+    ))
 
     # Backward compatibility, assume fixed batch size.
     if args.iteration > 0 and args.consumed_train_samples == 0:

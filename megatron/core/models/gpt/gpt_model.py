@@ -28,6 +28,8 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
+from vtimeline import TracePoint
+
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -379,6 +381,9 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
+
+        tp = TracePoint("OutputLayer", "Model", stream=torch.cuda.current_stream())
+        tp.begin()
         if (
             not self.training
             and inference_context is not None
@@ -389,6 +394,7 @@ class GPTModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+        tp.end()
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(

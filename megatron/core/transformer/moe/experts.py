@@ -38,6 +38,8 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 
+from vtimeline import TracePoint
+
 try:
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
@@ -736,6 +738,10 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
+
+        tp = TracePoint(f"-{sum(tokens_per_expert)}", "Model")
+        tp.begin()
+        
         if self.config.fp8:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
@@ -817,6 +823,8 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if self.config.fp8:
             output = self.fp8_unpadding(output, actual_tokens_per_expert)
+
+        tp.end()
 
         return output, output_bias
 

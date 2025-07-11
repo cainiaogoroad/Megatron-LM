@@ -9,6 +9,7 @@ from functools import partial
 from typing import Callable, List, Optional
 
 import torch
+from vtimeline import VLogger
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
@@ -166,6 +167,7 @@ def create_group(
         'use_local_synchronization': use_local_synchronization,
         'group_desc': group_desc,
     }
+    VLogger.info_rank0("create distributed group ({}) : {}".format(group_desc, ranks))
     if not is_torch_min_version('2.4.0'):
         kwargs.pop('group_desc')
         if timeout is None:

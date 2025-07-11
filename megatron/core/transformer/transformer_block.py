@@ -6,6 +6,7 @@ from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
+from vtimeline import TracePoint
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -520,6 +521,8 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
+                    tp = TracePoint(f"TransformerLayer-{l_no}", "Model", level="INFO")
+                    tp.begin()
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -546,6 +549,7 @@ class TransformerBlock(MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+                    tp.end()
 
         # Final layer norm.
         if self.final_layernorm is not None:

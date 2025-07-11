@@ -12,6 +12,8 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from vtimeline import TracePoint
+
 from .. import parallel_state
 from ..transformer.moe.moe_utils import get_updated_expert_bias
 from ..transformer.transformer_config import TransformerConfig
@@ -265,17 +267,25 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
+    tp = TracePoint("all-grads-sync", "DP")
+    tp.begin()
     for model_chunk in model:
         model_chunk.finish_grad_sync()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
+    tp.end()
 
     # All-reduce t_embedder grads (for pp & vpp of DiT).
     if config.timers is not None:
         config.timers('conditional-embedder-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
+
+    tp = TracePoint("conditional-embedder-grads-all-reduce", "DP")
+    tp.begin()
     _allreduce_conditional_embedding_grads(model, config)
+    tp.end()
+
     if config.timers is not None:
         config.timers('conditional-embedder-grads-all-reduce').stop()
 
@@ -284,7 +294,12 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         config.timers('layernorm-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
+
+    tp = TracePoint("layernorm-grads-all-reduce", "DP")
+    tp.begin()
     _allreduce_layernorm_grads(model, config)
+    tp.end()
+
     if config.timers is not None:
         config.timers('layernorm-grads-all-reduce').stop()
 
@@ -293,7 +308,12 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
+
+    tp = TracePoint("embedding-grads-all-reduce", "DP")
+    tp.begin()
     _allreduce_embedding_grads(model, config)
+    tp.end()
+
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
@@ -317,15 +337,21 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
             pp_group = [pp_group]
 
         # need to do a broadcast for every pp group, even though num_tokens should be the same.
+        tp = TracePoint("broadcast-tokens", "DP")
+        tp.begin()
         num_tokens_list = []
         for lr, group in zip(last_rank, pp_group):
             torch.distributed.broadcast(num_tokens, src=lr, group=group)
             num_tokens_list.append(torch.clone(num_tokens))
         assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
+        tp.end()
 
         # all-reduce across DP ranks.
+        tp = TracePoint("allreduce-tokens", "DP")
+        tp.begin()
         torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens
                 model_chunk.scale_gradients(scaling)
+        tp.end()

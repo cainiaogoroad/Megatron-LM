@@ -21,6 +21,8 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
+from vtimeline import TracePoint
+
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 from .. import tensor_parallel
@@ -2096,6 +2098,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
 
+        tp = TracePoint("params-all-gather", "Optimizer")
+        tp.begin()
         if self.ddp_config.use_custom_fsdp:
             for model_chunk in self.model_chunks:
                 model_chunk.start_param_sync()
@@ -2107,6 +2111,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if not self.ddp_config.overlap_param_gather:
                 for model_chunk in self.model_chunks:
                     model_chunk.start_param_sync()
+        tp.end()
         if timers is not None:
             timers('params-all-gather').stop()
 

@@ -33,6 +33,8 @@ from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
 
+from vtimeline import vinit
+
 
 def initialize_megatron(
     extra_args_provider=None,
@@ -91,6 +93,7 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+    vinit()
 
     # init rerun state
     def state_save_func():

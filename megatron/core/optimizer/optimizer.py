@@ -11,6 +11,7 @@ from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+from vtimeline import TracePoint
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
@@ -414,8 +415,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-to-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        tp = TracePoint("copy-to-main-grad", "Optimizer")
+        tp.begin()
         if not self.is_stub_optimizer:
             self._copy_model_grads_to_main_grads()
+        tp.end()
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
@@ -428,7 +432,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 timers('optimizer-unscale-and-check-inf', log_level=1).start(
                     barrier=self.config.barrier_with_L1_time
                 )
+            tp = TracePoint("unscale-and-check-inf", "Optimizer")
+            tp.begin()
             found_inf_flag = self._unscale_main_grads_and_check_for_nan()
+            tp.end()
             if timers is not None:
                 timers('optimizer-unscale-and-check-inf').stop()
 
@@ -449,8 +456,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        tp = TracePoint("inner-step", "Optimizer")
+        tp.begin()
         if not self.is_stub_optimizer:
             self.optimizer.step()
+        tp.end()
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
@@ -459,8 +469,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        tp = TracePoint("copy-main-to-model-params", "Optimizer")
+        tp.begin()
         if not self.is_stub_optimizer:
             self._copy_main_params_to_model_params()
+        tp.end()
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
@@ -479,9 +492,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-clip-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        tp = TracePoint("clip-main-grad", "Optimizer")
+        tp.begin()
         grad_norm = 0.0
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+        tp.end()
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -490,7 +506,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        tp = TracePoint("count-zeros", "Optimizer")
+        tp.begin()
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
+        tp.end()
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 

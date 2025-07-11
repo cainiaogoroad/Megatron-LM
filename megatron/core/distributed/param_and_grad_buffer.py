@@ -17,6 +17,9 @@ from ..fp8_utils import is_float8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
+from vtimeline import TracePoint
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -213,6 +216,8 @@ class _ParamAndGradBucketGroup:
             assert self.param_gather_handle is None
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
+        tp = TracePoint("ParamSync", "Optimizer", self.intra_distributed_optimizer_instance_group)
+        tp.begin()
         # Coalesce communication kernels across buckets in the bucket group.
         with _coalescing_manager(
             self.intra_distributed_optimizer_instance_group, async_ops=async_op
@@ -237,6 +242,7 @@ class _ParamAndGradBucketGroup:
             # None.
             self.param_gather_handle = None
         self.param_gather_dispatched = True
+        tp.end()
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
@@ -338,6 +344,8 @@ class _ParamAndGradBucketGroup:
         else:
             communication_group = self.data_parallel_group
 
+        tp = TracePoint("GradSync", "Optimizer", communication_group)
+        tp.begin()
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for bucket in self.buckets:
@@ -389,6 +397,8 @@ class _ParamAndGradBucketGroup:
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
             self.grad_reduce_handle = None
+
+        tp.end()
 
     def finish_grad_sync(self):
         """

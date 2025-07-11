@@ -209,8 +209,13 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             fatal=False,
         )
     # Reduce loss for logging.
+    from vtimeline import TracePoint
+
+    tp = TracePoint("AGLoss", "Model", stream=mpu.get_data_parallel_group())
+    tp.begin()
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+    tp.end()
 
     # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
     # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()

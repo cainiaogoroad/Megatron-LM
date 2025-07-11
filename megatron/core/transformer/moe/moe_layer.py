@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+from vtimeline import TracePoint
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.module import MegatronModule
@@ -139,14 +140,20 @@ class MoELayer(BaseMoELayer):
 
         # process MoE
         def custom_forward(hidden_states):
-            probs, routing_map = self.router(hidden_states)
-            (dispatched_input, tokens_per_expert, permuted_probs) = (
-                self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
-            )
-            expert_output, mlp_bias = self.experts(
-                dispatched_input, tokens_per_expert, permuted_probs
-            )
-            output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+            with TracePoint("Router", "MoE", torch.cuda.current_stream()):
+                probs, routing_map = self.router(hidden_states)
+            with TracePoint("Dispatch", "MoE", torch.cuda.current_stream()):
+                (dispatched_input, tokens_per_expert, permuted_probs) = (
+                    self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
+                )
+            with TracePoint("Experts", "MoE", torch.cuda.current_stream()):
+                expert_output, mlp_bias = self.experts(
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
+            with TracePoint("Combine", "MoE", torch.cuda.current_stream()):
+                output, mlp_bias = self.token_dispatcher.token_unpermutation(
+                    expert_output, mlp_bias
+                )
             if self.use_shared_expert and not self.shared_expert_overlap:
                 # if shared_expert_overlap is True, the expert calculation happens in
                 # the token_dispatcher to overlap communications and computations
