@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import sys
+import hashlib
 from typing import List, Optional
 
 import torch.distributed
@@ -131,6 +132,65 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
+
+def _get_optimizer_state_checksum(optimizer: 'Optimizer') -> int:
+    """Return a deterministic 64-bit checksum of **all** optimizer state tensors.
+
+    We use SHA-256 to avoid Python's built-in ``hash`` randomisation that would make
+    per-process hashes differ even for identical byte sequences.
+    """
+    hasher = hashlib.sha256()
+
+    # Iterate in a deterministic order: first by param id, then by state name.
+    for param_id in sorted(optimizer.state.keys()):
+        param_state = optimizer.state[param_id]
+        for state_name in sorted(param_state.keys()):
+            tensor = param_state[state_name]
+            if torch.is_tensor(tensor):
+                # NOTE: ``contiguous()`` avoids a potential clone for most tensors.
+                hasher.update(tensor.detach().view(-1).contiguous().cpu().numpy().tobytes())
+
+    # Truncate the digest to 8 bytes so we can pack it into a single int64 tensor.
+    digest = hasher.digest()[:8]
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
+def check_optimizer_states_across_dp_replicas(optimizer: 'Optimizer', iteration: int) -> bool:
+    """Return ``True`` if all data-parallel ranks have identical optimizer states.
+
+    The function computes a checksum (see ``_get_optimizer_state_checksum``) on each
+    rank and then uses an ``all_reduce`` to verify that every rank has the same
+    value. This avoids the heavy ``all_gather`` of the full hash list used before.
+    """
+
+    dp_group = mpu.get_data_parallel_group()
+    dp_world_size = torch.distributed.get_world_size(group=dp_group)
+
+    if dp_world_size == 1:
+        return True
+
+    local_checksum = _get_optimizer_state_checksum(optimizer)
+    checksum_tensor = torch.tensor([local_checksum], dtype=torch.uint64, device="cuda")
+
+    # Sum of identical checksums should equal ``local_checksum * dp_world_size``.
+    checksum_sum = checksum_tensor.clone()
+    torch.distributed.all_reduce(checksum_sum, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+
+    if checksum_sum.item() == local_checksum * dp_world_size:
+        if mpu.get_data_parallel_rank() == 0:
+            print(
+                f" > (Iteration {iteration}) Optimizer states are consistent across DP replicas.",
+                flush=True,
+            )
+        return True
+    else:
+        if mpu.get_data_parallel_rank() == 0:
+            print(
+                f" > (Iteration {iteration}) Optimizer states are INCONSISTENT across DP replicas.",
+                flush=True,
+            )
+        return False
 
 
 def destroy_global_state():
@@ -1421,6 +1481,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+
+    # Check for optimizer state consistency across DP ranks.
+    # You can control the frequency of this check with the 'iteration' number.
+    # For example, to check every 10 iterations:
+    # `if args.curr_iteration % 10 == 0:`
+    if args.curr_iteration % 10 == 0:  # 每 10 次迭代检查一次
+        if not check_optimizer_states_across_dp_replicas(optimizer, args.curr_iteration):
+            # 报错
+            raise ValueError("Optimizer states are inconsistent across DP ranks.")
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
