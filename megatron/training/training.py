@@ -111,7 +111,7 @@ from . import one_logger_utils
 
 from . import ft_integration
 
-from vtimeline import VLogger, TracePoint, MemRecorder, CUPTI, MetricRecorder
+from vtimeline import VLogger, TracePoint, MemRecorder, CUPTI, MetricRecorder, MegatronCollector
 
 stimer = StragglerDetector()
 
@@ -747,6 +747,7 @@ def pretrain(
     app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context)
+    MegatronCollector.set_core(model, optimizer, opt_param_scheduler)
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
@@ -1311,6 +1312,8 @@ def train_step(forward_step_func, data_iterator,
     optimizer_tp = TracePoint("optimizer-step", "Train")
     optimizer_tp.begin()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    MegatronCollector.dump_model("model-after-optimizer-step")
+    MegatronCollector.dump_main_param("main-param-after-optimizer-step")
     optimizer_tp.end()
     timers('optimizer').stop()
 
@@ -1997,6 +2000,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     while iteration < args.train_iters:
         MemRecorder.record()
         CUPTI.step()
+        MegatronCollector.step()
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
                 prof.step()

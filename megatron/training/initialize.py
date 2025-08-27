@@ -15,7 +15,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.parallel_state import create_group
+from megatron.core.parallel_state import create_group, get_all_ranks_info
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -33,7 +33,7 @@ from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
 
-from vtimeline import vinit
+from vtimeline import vinit, MegatronCollector
 
 
 def initialize_megatron(
@@ -165,6 +165,8 @@ def initialize_megatron(
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
             _initialize_tp_communicators()
+
+        MegatronCollector.set_process_group_info(get_all_ranks_info())
 
         # No continuation function
         return None

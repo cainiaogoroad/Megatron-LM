@@ -518,6 +518,8 @@ def get_megatron_optimizer(
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
     ):
+        log_single_rank(logger, logging.INFO, 'GET DENSE PG')
+
         param_groups, buffers = _get_param_groups_and_buffers(
             dense_model_chunks,
             model_chunk_offset=model_chunk_offset,
@@ -557,6 +559,7 @@ def get_megatron_optimizer(
         )
         model_chunk_offset += 1
 
+    log_single_rank(logger, logging.INFO, 'GET MOE PG')
     moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
         model_chunks,
         model_chunk_offset=0,

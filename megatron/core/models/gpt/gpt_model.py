@@ -5,6 +5,7 @@ from typing import Dict, Literal, Optional
 
 import torch
 from torch import Tensor
+from vtimeline import TracePoint
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -27,8 +28,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-
-from vtimeline import TracePoint
 
 
 class GPTModel(LanguageModule):
@@ -380,7 +379,6 @@ class GPTModel(LanguageModule):
 
         if not self.post_process:
             return hidden_states
-
 
         tp = TracePoint("OutputLayer", "Model", stream=torch.cuda.current_stream())
         tp.begin()

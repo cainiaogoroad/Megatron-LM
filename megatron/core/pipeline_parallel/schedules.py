@@ -5,7 +5,7 @@ from typing import Iterator, List, Union
 
 import torch
 from torch.autograd.variable import Variable
-from vtimeline import TracePoint
+from vtimeline import TracePoint, MegatronCollector
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
@@ -305,6 +305,12 @@ def forward_step(
             data = loss_func(output_tensor, non_loss_data=True)
             forward_data_store.append(data)
 
+    # when compelete the forward, the model weight is sync by allgather
+    # we also need to distinguish the different microbatch, because 
+    # only in different microbatch, the model weight is different
+    MegatronCollector.dump_model(f"model-after-forward-mbs-{current_microbatch}")
+    MegatronCollector.dump_main_param(f"main-param-after-forward-mbs-{current_microbatch}")
+
     tp.end()
     if config.timers is not None:
         config.timers('forward-compute').stop()
@@ -425,6 +431,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
 
+    MegatronCollector.dump_model("model-after-backward")
+    MegatronCollector.dump_main_param("main-param-after-backward")
     tp.end()
 
     if config.timers is not None:

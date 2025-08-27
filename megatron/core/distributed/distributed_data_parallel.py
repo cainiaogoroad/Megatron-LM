@@ -15,6 +15,8 @@ from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
+from vtimeline import MegatronCollector
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +102,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 dense_params.append(param)
             else:
                 expert_parallel_params.append(param)
+
+        self.param_to_name = param_to_name
 
         def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
@@ -413,6 +417,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
                     param.main_grad.add_(param.grad.data)
+                MegatronCollector.dump_main_grad(param, self.param_to_name[param], "main-grad-in-backward")
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:

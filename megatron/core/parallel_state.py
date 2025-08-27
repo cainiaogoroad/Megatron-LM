@@ -1993,6 +1993,16 @@ def get_all_ranks():
     ]
     return '_'.join(map(lambda x: str(x or 0), ranks))
 
+def get_all_ranks_info():
+    return {
+        "tp": get_tensor_model_parallel_rank(),
+        "dp": get_data_parallel_rank(),
+        "cp": get_context_parallel_rank(),
+        "pp": get_pipeline_model_parallel_rank(),
+        "ep": get_expert_model_parallel_rank(),
+        "etp": get_expert_tensor_parallel_rank(),
+    }
+
 
 def get_moe_layer_wise_logging_tracker():
     """Return the moe layer wise tracker."""

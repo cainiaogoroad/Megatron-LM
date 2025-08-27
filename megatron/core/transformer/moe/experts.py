@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from vtimeline import TracePoint
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -37,8 +38,6 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
-
-from vtimeline import TracePoint
 
 try:
 
@@ -741,7 +740,7 @@ class TEGroupedMLP(MegatronModule):
 
         tp = TracePoint(f"-{sum(tokens_per_expert)}", "Model")
         tp.begin()
-        
+
         if self.config.fp8:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(

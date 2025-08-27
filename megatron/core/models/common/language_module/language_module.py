@@ -13,13 +13,13 @@ try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
 except:
     te_parallel_cross_entropy = None
+from vtimeline import TracePoint
+
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
-
-from vtimeline import TracePoint
 
 
 class LanguageModule(MegatronModule):

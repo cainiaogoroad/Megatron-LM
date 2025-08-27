@@ -10,15 +10,13 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.distributed import _coalescing_manager
+from vtimeline import TracePoint
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..fp8_utils import is_float8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-
-from vtimeline import TracePoint
-
 
 logger = logging.getLogger(__name__)
 
