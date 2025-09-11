@@ -311,6 +311,7 @@ def forward_step(
     MegatronCollector.dump_model(f"model-after-forward-mbs-{current_microbatch}")
     MegatronCollector.dump_main_param(f"main-param-after-forward-mbs-{current_microbatch}")
 
+
     tp.end()
     if config.timers is not None:
         config.timers('forward-compute').stop()
@@ -431,6 +432,44 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
 
+
+    # 在 dump 之前，按需对某个参数注入“错误”，用于制造不一致以验证检查
+    try:
+        import os
+        import torch
+        from megatron_collector import MegatronCollector
+
+        if os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0") == "1":
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            dp_rank = MegatronCollector.ranks_info_.get("dp_rank")
+            if dp_rank == target_dp_rank and MegatronCollector.model_:
+                param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR")  # 可选
+                delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-3"))
+                op = os.getenv("MEGATRON_CORRUPT_OP", "add")  # add | scale | zero
+
+                with torch.no_grad():
+                    # 取第一个 model；如需更细粒度控制可扩展为遍历所有 model
+                    chosen = None
+                    for pname, p in MegatronCollector.model_[0].named_parameters():
+                        if param_substr is None or param_substr in pname:
+                            chosen = (pname, p)
+                            break
+
+                    if chosen is not None:
+                        name, p = chosen
+                        if op == "add":
+                            p.add_(delta)
+                        elif op == "scale":
+                            p.mul_(1.0 + delta)
+                        elif op == "zero":
+                            p.zero_()
+                        else:
+                            p.add_(delta)  # 回退到 add
+                        print(f"[corrupt] Modified param {name} with op={op}, delta={delta} on dp_rank={dp_rank}")
+    except Exception as e:
+        print(f"[corrupt] Injection failed: {e}")
+
+        
     MegatronCollector.dump_model("model-after-backward")
     MegatronCollector.dump_main_param("main-param-after-backward")
     tp.end()
