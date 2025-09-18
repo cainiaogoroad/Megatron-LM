@@ -39,6 +39,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from vtimeline import TracePoint, MegatronCollector
 
 
 stimer = StragglerDetector()
@@ -244,6 +245,12 @@ def forward_step(data_iterator, model: GPTModel):
     with stimer(bdata=True):
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
             data_iterator)
+        # 采集训练数据的关键信息
+        MegatronCollector.dump_training_batch(
+            tokens, labels, loss_mask, attention_mask, position_ids,
+            stage_name="after-get-batch",
+        )
+    
     timers('batch-generator').stop()
 
     with stimer:
