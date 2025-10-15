@@ -2266,6 +2266,9 @@ def train(
 
         # Run training step.
         args.curr_iteration = iteration
+        # [SDCCheck] Set current iteration in optimizer for error injection
+        if hasattr(optimizer, '_current_step'):
+            optimizer._current_step = iteration
         ft_integration.on_training_step_start()
         (
             loss_dict,

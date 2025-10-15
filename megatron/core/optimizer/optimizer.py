@@ -531,6 +531,79 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         return True
 
+    def _inject_dp_inconsistency_error(self):
+        """
+        Inject DP inconsistency errors through environment variables (SDCCheck).
+        
+        This method allows controlled injection of parameter inconsistencies across
+        different data parallel ranks for testing constraint validation systems.
+        
+        Environment Variables:
+            SDCCHECK_INJECT_DP_ERROR: "1" to enable error injection (default: "0")
+            SDCCHECK_ERROR_DP_RANK: Target DP rank for error injection (default: "0")
+            SDCCHECK_ERROR_PARAM_PATTERN: Parameter name pattern to match (default: "layers.0")
+            SDCCHECK_ERROR_SCALE: Perturbation scale (default: "1e-5")
+            SDCCHECK_ERROR_START_STEP: Step number to start injection (default: "2")
+        """
+        import os
+        
+        # Check if error injection is enabled
+        if os.getenv("SDCCHECK_INJECT_DP_ERROR", "0") != "1":
+            return
+        
+        # Get configuration from environment variables
+        target_dp_rank = int(os.getenv("SDCCHECK_ERROR_DP_RANK", "0"))
+        param_pattern = os.getenv("SDCCHECK_ERROR_PARAM_PATTERN", "layers.0")
+        error_scale = float(os.getenv("SDCCHECK_ERROR_SCALE", "1e-5"))
+        start_step = int(os.getenv("SDCCHECK_ERROR_START_STEP", "2"))
+        
+        # Get current rank information
+        current_dp_rank = parallel_state.get_data_parallel_rank()
+        current_step = getattr(self, '_current_step', 0)
+        
+        # Only inject error on specified DP rank and after start step
+        if current_dp_rank != target_dp_rank or current_step < start_step:
+            return
+        
+        # Flag to track if we've injected any errors
+        injected_count = 0
+        
+        # Inject errors into matching parameters
+        with torch.no_grad():
+            # For Float16OptimizerWithFloat16Params
+            if hasattr(self, 'fp32_from_float16_groups'):
+                for group_idx, param_group in enumerate(self.fp32_from_float16_groups):
+                    for param in param_group:
+                        # Try to get parameter name
+                        param_name = getattr(param, '_param_name', '')
+                        if not param_name and hasattr(param, 'ds_id'):
+                            param_name = f"param_{param.ds_id}"
+                        
+                        # Check if parameter name matches pattern
+                        if param_pattern in param_name:
+                            # Add random noise
+                            noise = torch.randn_like(param.data) * error_scale
+                            param.data.add_(noise)
+                            injected_count += 1
+            
+            # For other optimizer types, check optimizer param_groups
+            if hasattr(self, 'optimizer') and hasattr(self.optimizer, 'param_groups'):
+                for param_group in self.optimizer.param_groups:
+                    for param in param_group['params']:
+                        param_name = getattr(param, '_param_name', '')
+                        if param_pattern in param_name:
+                            noise = torch.randn_like(param.data) * error_scale
+                            param.data.add_(noise)
+                            injected_count += 1
+        
+        # Log injection (only rank 0 logs to avoid spam)
+        if torch.distributed.get_rank() == 0 and injected_count > 0:
+            logger.warning(
+                f"[SDCCheck] Injected DP inconsistency errors: "
+                f"dp_rank={current_dp_rank}, step={current_step}, "
+                f"pattern='{param_pattern}', count={injected_count}, scale={error_scale}"
+            )
+
     @torch.no_grad()
     def step(self):
         timers = self.config.timers
@@ -560,6 +633,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros').stop()
 
         success = self.step_with_ready_grads()
+
+        # [SDCCheck] Inject DP inconsistency errors if enabled via environment variables
+        self._inject_dp_inconsistency_error()
 
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
