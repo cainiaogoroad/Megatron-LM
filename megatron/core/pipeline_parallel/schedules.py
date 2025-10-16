@@ -437,7 +437,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     try:
         import os
         import torch
-        from megatron_collector import MegatronCollector
+        from vtimeline import MegatronCollector
 
         if os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0") == "1":
             target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
