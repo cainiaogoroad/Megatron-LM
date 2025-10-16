@@ -433,41 +433,169 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         input_tensor_grad = input_tensor_grad[0]
 
 
-    # 在 dump 之前，按需对某个参数注入“错误”，用于制造不一致以验证检查
+    # ========================================
+    # 错误注入机制 - 用于测试SDCCheck约束检测系统
+    # ========================================
+    # 在 dump 之前，按需对某个参数注入"错误"，用于制造不一致以验证检查
+    # 支持的注入方式：
+    #   1. add    - 加法扰动：param += delta
+    #   2. scale  - 缩放扰动：param *= (1 + delta)
+    #   3. zero   - 清零操作：param = 0
+    #   4. noise  - 随机噪声：param += uniform(-delta, delta)
+    #   5. flip   - 符号翻转：param *= -1
+    #   6. nan    - 设置NaN：param = NaN
+    # ========================================
     try:
         import os
         import torch
         from vtimeline import MegatronCollector
+        from datetime import datetime
 
-        if os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0") == "1":
+        # 🔍 血缘日志：检查是否启用注入
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        if inject_enabled == "1":
+            print(f"\n{'='*70}")
+            print(f"[📍 INJECT] 错误注入系统已启动")
+            print(f"[📍 INJECT] 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+            print(f"[📍 INJECT] 位置: schedules.py::backward_step() @ line 436")
+            print(f"[📍 INJECT] 阶段: Backward Pass 完成后, Dump 之前")
+            print(f"{'='*70}")
+            
+            # 🔍 血缘日志：读取配置参数
             target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
-            dp_rank = MegatronCollector.ranks_info_.get("dp_rank")
-            if dp_rank == target_dp_rank and MegatronCollector.model_:
-                param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR")  # 可选
-                delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-3"))
-                op = os.getenv("MEGATRON_CORRUPT_OP", "add")  # add | scale | zero
-
-                with torch.no_grad():
-                    # 取第一个 model；如需更细粒度控制可扩展为遍历所有 model
-                    chosen = None
-                    for pname, p in MegatronCollector.model_[0].named_parameters():
-                        if param_substr is None or param_substr in pname:
-                            chosen = (pname, p)
-                            break
-
-                    if chosen is not None:
-                        name, p = chosen
-                        if op == "add":
-                            p.add_(delta)
-                        elif op == "scale":
-                            p.mul_(1.0 + delta)
-                        elif op == "zero":
-                            p.zero_()
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR")
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-3"))
+            op = os.getenv("MEGATRON_CORRUPT_OP", "add")
+            current_step = getattr(MegatronCollector, 'step_', 'unknown')
+            
+            print(f"[⚙️  CONFIG] 注入配置:")
+            print(f"[⚙️  CONFIG]   - 目标DP Rank: {target_dp_rank}")
+            print(f"[⚙️  CONFIG]   - 参数匹配模式: {param_substr if param_substr else '<任意参数>'}")
+            print(f"[⚙️  CONFIG]   - 扰动幅度: {delta}")
+            print(f"[⚙️  CONFIG]   - 操作类型: {op}")
+            print(f"[⚙️  CONFIG]   - 当前训练步: Step {current_step}")
+            
+            # 🔍 血缘日志：获取当前进程信息
+            dp_rank = MegatronCollector.ranks_info_.get("dp", -1) if hasattr(MegatronCollector, 'ranks_info_') else -1
+            tp_rank = MegatronCollector.ranks_info_.get("tp", -1) if hasattr(MegatronCollector, 'ranks_info_') else -1
+            pp_rank = MegatronCollector.ranks_info_.get("pp", -1) if hasattr(MegatronCollector, 'ranks_info_') else -1
+            
+            print(f"[🏷️  RANK] 当前进程信息:")
+            print(f"[🏷️  RANK]   - DP Rank: {dp_rank}")
+            print(f"[🏷️  RANK]   - TP Rank: {tp_rank}")
+            print(f"[🏷️  RANK]   - PP Rank: {pp_rank}")
+            
+            # 🔍 血缘日志：检查是否是目标rank
+            if dp_rank == target_dp_rank:
+                print(f"[✅ MATCH] 当前DP rank ({dp_rank}) 匹配目标rank ({target_dp_rank})")
+                
+                if MegatronCollector.model_:
+                    print(f"[✅ MODEL] 模型已加载，共 {len(MegatronCollector.model_)} 个模型")
+                    
+                    with torch.no_grad():
+                        # 🔍 血缘日志：搜索匹配的参数
+                        print(f"[🔍 SEARCH] 正在搜索匹配的参数...")
+                        total_params = 0
+                        chosen = None
+                        
+                        for pname, p in MegatronCollector.model_[0].named_parameters():
+                            total_params += 1
+                            if param_substr is None or param_substr in pname:
+                                chosen = (pname, p)
+                                print(f"[🎯 FOUND] 找到匹配参数: {pname}")
+                                print(f"[🎯 FOUND]   - 形状: {list(p.shape)}")
+                                print(f"[🎯 FOUND]   - 数据类型: {p.dtype}")
+                                print(f"[🎯 FOUND]   - 设备: {p.device}")
+                                print(f"[🎯 FOUND]   - 是否需要梯度: {p.requires_grad}")
+                                break
+                        
+                        if chosen is None:
+                            print(f"[⚠️  WARNING] 未找到匹配参数（共扫描 {total_params} 个参数）")
+                            if param_substr:
+                                print(f"[⚠️  WARNING] 匹配模式 '{param_substr}' 可能不正确")
                         else:
-                            p.add_(delta)  # 回退到 add
-                        print(f"[corrupt] Modified param {name} with op={op}, delta={delta} on dp_rank={dp_rank}")
+                            name, p = chosen
+                            
+                            # 🔍 血缘日志：记录注入前的状态
+                            param_mean_before = p.mean().item()
+                            param_std_before = p.std().item()
+                            param_min_before = p.min().item()
+                            param_max_before = p.max().item()
+                            
+                            print(f"[📊 BEFORE] 注入前参数统计:")
+                            print(f"[📊 BEFORE]   - 均值: {param_mean_before:.6e}")
+                            print(f"[📊 BEFORE]   - 标准差: {param_std_before:.6e}")
+                            print(f"[📊 BEFORE]   - 最小值: {param_min_before:.6e}")
+                            print(f"[📊 BEFORE]   - 最大值: {param_max_before:.6e}")
+                            
+                            # 🔍 血缘日志：执行注入操作
+                            print(f"[💉 INJECT] 正在执行注入操作: {op}")
+                            
+                            if op == "add":
+                                print(f"[💉 INJECT]   操作: param += {delta}")
+                                p.add_(delta)
+                            elif op == "scale":
+                                scale_factor = 1.0 + delta
+                                print(f"[💉 INJECT]   操作: param *= {scale_factor}")
+                                p.mul_(scale_factor)
+                            elif op == "zero":
+                                print(f"[💉 INJECT]   操作: param = 0 (清零)")
+                                p.zero_()
+                            elif op == "noise":
+                                noise = torch.rand_like(p) * 2 * delta - delta
+                                print(f"[💉 INJECT]   操作: param += uniform(-{delta}, {delta})")
+                                p.add_(noise)
+                            elif op == "flip":
+                                print(f"[💉 INJECT]   操作: param *= -1 (符号翻转)")
+                                p.mul_(-1)
+                            elif op == "nan":
+                                print(f"[💉 INJECT]   操作: param[:10] = NaN")
+                                p.flatten()[:10].fill_(float('nan'))
+                            else:
+                                print(f"[💉 INJECT]   操作: <未知操作 '{op}'>, 回退到 add")
+                                p.add_(delta)
+                            
+                            # 🔍 血缘日志：记录注入后的状态
+                            param_mean_after = p.mean().item() if not torch.isnan(p).any() else float('nan')
+                            param_std_after = p.std().item() if not torch.isnan(p).any() else float('nan')
+                            param_min_after = p.min().item() if not torch.isnan(p).any() else float('nan')
+                            param_max_after = p.max().item() if not torch.isnan(p).any() else float('nan')
+                            
+                            print(f"[📊 AFTER] 注入后参数统计:")
+                            print(f"[📊 AFTER]   - 均值: {param_mean_after:.6e}")
+                            print(f"[📊 AFTER]   - 标准差: {param_std_after:.6e}")
+                            print(f"[📊 AFTER]   - 最小值: {param_min_after:.6e}")
+                            print(f"[📊 AFTER]   - 最大值: {param_max_after:.6e}")
+                            
+                            # 🔍 血缘日志：计算变化量
+                            if not (torch.isnan(p).any() or op == "zero"):
+                                mean_change = param_mean_after - param_mean_before
+                                mean_change_percent = (mean_change / param_mean_before * 100) if param_mean_before != 0 else 0
+                                print(f"[📈 DELTA] 参数变化:")
+                                print(f"[📈 DELTA]   - 均值变化: {mean_change:.6e} ({mean_change_percent:.4f}%)")
+                            
+                            print(f"[✅ SUCCESS] 参数注入完成!")
+                            print(f"[✅ SUCCESS]   - 参数名: {name}")
+                            print(f"[✅ SUCCESS]   - DP Rank: {dp_rank}")
+                            print(f"[✅ SUCCESS]   - 操作: {op}")
+                            print(f"[✅ SUCCESS]   - 扰动幅度: {delta}")
+                            print(f"[✅ SUCCESS]   - Step: {current_step}")
+                else:
+                    print(f"[❌ ERROR] 模型未加载或为空")
+            else:
+                print(f"[⏭️  SKIP] 当前DP rank ({dp_rank}) != 目标rank ({target_dp_rank}), 跳过注入")
+            
+            print(f"{'='*70}\n")
+        
     except Exception as e:
-        print(f"[corrupt] Injection failed: {e}")
+        print(f"\n{'='*70}")
+        print(f"[❌ ERROR] 错误注入失败!")
+        print(f"[❌ ERROR] 异常类型: {type(e).__name__}")
+        print(f"[❌ ERROR] 异常信息: {e}")
+        import traceback
+        print(f"[❌ ERROR] 堆栈跟踪:")
+        traceback.print_exc()
+        print(f"{'='*70}\n")
 
         
     MegatronCollector.dump_model("model-after-backward")
