@@ -445,32 +445,111 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     try:
         import os
         import torch
-        from vtimeline import MegatronCollector
+        from megatron_collector import MegatronCollector
 
-        if os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0") == "1":
+        # 🔍 诊断日志 1: 检查环境变量
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        print(f"[corrupt-debug] MEGATRON_INJECT_PARAM_CORRUPTION={inject_enabled}", flush=True)
+        
+        if inject_enabled == "1":
+            # 🔍 诊断日志 2: 读取配置
             target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
-            dp_rank = MegatronCollector.ranks_info_.get("dp_rank")
-            
-            # 新增：控制是否在特定step注入
             inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
-            current_step = getattr(MegatronCollector, 'step_', 0)
+            op = os.getenv("MEGATRON_CORRUPT_OP", "add")
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR")
+            
+            print(f"[corrupt-debug] Configuration:", flush=True)
+            print(f"[corrupt-debug]   - target_dp_rank={target_dp_rank}", flush=True)
+            print(f"[corrupt-debug]   - inject_step={inject_step}", flush=True)
+            print(f"[corrupt-debug]   - op={op}", flush=True)
+            print(f"[corrupt-debug]   - param_substr={param_substr}", flush=True)
+            
+            # 🔍 诊断日志 3: 检查MegatronCollector状态
+            has_ranks_info = hasattr(MegatronCollector, 'ranks_info_')
+            has_model = hasattr(MegatronCollector, 'model_')
+            has_step = hasattr(MegatronCollector, 'step_')
+            
+            print(f"[corrupt-debug] MegatronCollector status:", flush=True)
+            print(f"[corrupt-debug]   - has_ranks_info_={has_ranks_info}", flush=True)
+            print(f"[corrupt-debug]   - has_model_={has_model}", flush=True)
+            print(f"[corrupt-debug]   - has_step_={has_step}", flush=True)
+            
+            if has_ranks_info:
+                dp_rank = MegatronCollector.ranks_info_.get("dp_rank")
+                print(f"[corrupt-debug]   - dp_rank={dp_rank}", flush=True)
+            else:
+                dp_rank = None
+                print(f"[corrupt-debug]   - dp_rank=None (ranks_info_ not available)", flush=True)
+            
+            if has_model:
+                model_is_none = MegatronCollector.model_ is None
+                model_empty = len(MegatronCollector.model_) == 0 if not model_is_none else True
+                print(f"[corrupt-debug]   - model_ is None={model_is_none}", flush=True)
+                if not model_is_none:
+                    print(f"[corrupt-debug]   - model_ length={len(MegatronCollector.model_)}", flush=True)
+            
+            if has_step:
+                current_step = MegatronCollector.step_
+                print(f"[corrupt-debug]   - current_step={current_step}", flush=True)
+            else:
+                current_step = 0
+                print(f"[corrupt-debug]   - current_step=0 (default, step_ not available)", flush=True)
+            
             should_inject = (inject_step == -1 or current_step == inject_step)
+            print(f"[corrupt-debug]   - should_inject={should_inject} (inject_step={inject_step}, current_step={current_step})", flush=True)
+            
+            # 🔍 诊断日志 4: 检查条件
+            rank_match = (dp_rank == target_dp_rank)
+            has_model_check = hasattr(MegatronCollector, 'model_') and MegatronCollector.model_ is not None
+            
+            print(f"[corrupt-debug] Condition checks:", flush=True)
+            print(f"[corrupt-debug]   - rank_match={rank_match} (dp_rank={dp_rank}, target={target_dp_rank})", flush=True)
+            print(f"[corrupt-debug]   - has_model_check={has_model_check}", flush=True)
+            print(f"[corrupt-debug]   - should_inject={should_inject}", flush=True)
+            print(f"[corrupt-debug]   - ALL CONDITIONS={rank_match and has_model_check and should_inject}", flush=True)
             
             if dp_rank == target_dp_rank and MegatronCollector.model_ and should_inject:
-                param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR")  # 可选
+                print(f"[corrupt-debug] ✓ All conditions passed, proceeding with injection", flush=True)
+                
+                # 重新读取配置（避免被之前的print覆盖）
+                param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR")
                 delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-3"))
-                op = os.getenv("MEGATRON_CORRUPT_OP", "add")  # add | scale | zero | reshape
+                op = os.getenv("MEGATRON_CORRUPT_OP", "add")
                 reshape_strategy = os.getenv("MEGATRON_RESHAPE_STRATEGY", "transpose")
+                
+                print(f"[corrupt-debug] Final config for injection:", flush=True)
+                print(f"[corrupt-debug]   - op={op}", flush=True)
+                print(f"[corrupt-debug]   - param_substr={param_substr}", flush=True)
+                print(f"[corrupt-debug]   - delta={delta}", flush=True)
+                print(f"[corrupt-debug]   - reshape_strategy={reshape_strategy}", flush=True)
 
                 with torch.no_grad():
-                    # 取第一个 model；如需更细粒度控制可扩展为遍历所有 model
+                    # 🔍 诊断日志 5: 参数搜索
+                    print(f"[corrupt-debug] Searching for parameters in model...", flush=True)
+                    total_params_scanned = 0
+                    matched_params = []
+                    
                     chosen = None
                     for pname, p in MegatronCollector.model_[0].named_parameters():
+                        total_params_scanned += 1
+                        # 打印前5个参数名用于调试
+                        if total_params_scanned <= 5:
+                            print(f"[corrupt-debug]   - param {total_params_scanned}: {pname}, shape={list(p.shape)}", flush=True)
+                        
                         if param_substr is None or param_substr in pname:
-                            chosen = (pname, p)
-                            break
+                            matched_params.append(pname)
+                            if chosen is None:
+                                chosen = (pname, p)
+                    
+                    print(f"[corrupt-debug] Total params scanned: {total_params_scanned}", flush=True)
+                    print(f"[corrupt-debug] Matched params: {len(matched_params)}", flush=True)
+                    if matched_params:
+                        print(f"[corrupt-debug] First matched param: {matched_params[0]}", flush=True)
+                        if len(matched_params) > 1:
+                            print(f"[corrupt-debug] Other matches: {matched_params[1:3]}", flush=True)
 
                     if chosen is not None:
+                        print(f"[corrupt-debug] ✓ Parameter selected for injection: {chosen[0]}", flush=True)
                         name, p = chosen
                         original_shape = p.shape
                         
@@ -486,9 +565,14 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                         elif op == "reshape":
                             # 🔴 Shape破坏注入：改变参数的shape
                             # 警告：这会导致all-reduce失败！仅用于测试约束检测
+                            print(f"[corrupt] ▶ Entering reshape branch", flush=True)
                             print(f"[corrupt] Applying reshape to {name} with strategy={reshape_strategy} on dp_rank={dp_rank}, step={current_step}", flush=True)
+                            print(f"[corrupt] Original shape: {list(original_shape)}, dtype={p.dtype}, device={p.device}", flush=True)
                             try:
+                                print(f"[corrupt-debug] Checking shape dimensions: len={len(original_shape)}", flush=True)
                                 if len(original_shape) >= 2:
+                                    print(f"[corrupt-debug] ✓ Shape has >= 2 dimensions, can proceed", flush=True)
+                                    print(f"[corrupt-debug] Using reshape strategy: {reshape_strategy}", flush=True)
                                     if reshape_strategy == "transpose":
                                         if original_shape[0] != original_shape[1]:
                                             # 转置前两个维度
@@ -523,10 +607,28 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                             except Exception as reshape_error:
                                 print(f"[corrupt] Reshape failed for {name}: {reshape_error}", flush=True)
                         else:
+                            print(f"[corrupt] ⚠ Unknown operation: {op}, falling back to add", flush=True)
                             p.add_(delta)  # 回退到 add
                             print(f"[corrupt] Modified param {name} with op={op} (fallback to add), delta={delta} on dp_rank={dp_rank}", flush=True)
+                    else:
+                        # 🔍 诊断日志 6: 没有找到匹配的参数
+                        print(f"[corrupt-debug] ✗ No parameter matched!", flush=True)
+                        print(f"[corrupt-debug]   - param_substr={param_substr}", flush=True)
+                        print(f"[corrupt-debug]   - total_params_scanned={total_params_scanned}", flush=True)
+                        print(f"[corrupt-debug]   - Suggestion: Check if param_substr is correct", flush=True)
+            else:
+                # 🔍 诊断日志 7: 条件不满足
+                print(f"[corrupt-debug] ✗ Injection conditions not met", flush=True)
+                if dp_rank != target_dp_rank:
+                    print(f"[corrupt-debug]   - Rank mismatch: dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+                if not (hasattr(MegatronCollector, 'model_') and MegatronCollector.model_):
+                    print(f"[corrupt-debug]   - Model not available", flush=True)
+                if not should_inject:
+                    print(f"[corrupt-debug]   - Step mismatch: current_step={current_step}, inject_step={inject_step}", flush=True)
+        else:
+            print(f"[corrupt-debug] ✗ Injection disabled (MEGATRON_INJECT_PARAM_CORRUPTION != 1)", flush=True)
     except Exception as e:
-        print(f"[corrupt] Injection failed: {e}", flush=True)
+        print(f"[corrupt] ✗ Injection failed with exception: {e}", flush=True)
         import traceback
         traceback.print_exc()
 
