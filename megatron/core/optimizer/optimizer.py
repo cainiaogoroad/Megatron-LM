@@ -11,7 +11,6 @@ from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-from vtimeline import TracePoint
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
@@ -91,6 +90,9 @@ def _multi_tensor_copy_this_to_that(
     else:
         for this_, that_ in zip(this, that):
             that_.copy_(this_)
+
+
+param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 
 
 class MegatronOptimizer(ABC):
@@ -286,7 +288,10 @@ class MegatronOptimizer(ABC):
 
     @abstractmethod
     def sharded_state_dict(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Builds sharded state dict for the optimizer, based on model's sharded state dict.
 
@@ -294,6 +299,7 @@ class MegatronOptimizer(ABC):
             model_sharded_state_dict (ShardedStateDict): sharded state dict of the model
             is_loading (bool, optional): flag indicating whether the state dict will be
                 used to save or load the optimizer state. Defaults to False.
+            metadata (dict, optional): metadata controlling the sharded_state_dict logic.
 
         Returns: optimizer sharded state dict
         """
@@ -317,6 +323,60 @@ class MegatronOptimizer(ABC):
     def _restore_common_per_param_step(state_dict: Dict, step: Union[int, torch.Tensor]):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
+
+    @staticmethod
+    def _filter_and_reorder_param_groups(
+        current_groups: List[Dict], state_dict_groups: List[Dict]
+    ) -> List[Dict]:
+        """Filter and reorder state_dict parameter groups to match current optimizer groups.
+        Keys used for matching align with those from _get_param_groups:
+        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+
+        Args:
+            current_groups (List[Dict]): Parameter groups from the current optimizer instance.
+            state_dict_groups (List[Dict]): Parameter groups loaded from a state dict.
+
+        Returns:
+            List[Dict]: Filtered and reordered parameter groups matching the current optimizer.
+
+        Raises:
+            ValueError: If parameter groups in state dict don't match current optimizer.
+        """
+        # Define groups order that is needed in the current optimizer (coming from runtime)
+        needed_groups = [
+            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
+            for g in current_groups
+        ]
+
+        # Keep state_dict param group order since groups are LocalNonpersistentObject
+        # and their order is determined at runtime, not from the checkpoint.
+        params_in_state_dict_order = [g['params'] for g in state_dict_groups]
+        loaded_groups_map = {
+            tuple(
+                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+                group[key] if key in group else group[f"pre_{key}"]
+                for key in param_group_identifier_keys
+            ): group
+            for group in state_dict_groups
+        }
+
+        final_groups = []
+        for key, params in zip(needed_groups, params_in_state_dict_order):
+            if key not in loaded_groups_map:
+                available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
+                raise ValueError(
+                    f"Could not find parameter group with key {key} in loaded checkpoint.\n"
+                    f"Available keys:\n{available_keys}\n"
+                    f"Parameter group key definition: {param_group_identifier_keys}"
+                )
+
+            # Update group's parameters to preserve state dict ordering
+            group = loaded_groups_map[key]
+            group['params'] = params
+            final_groups.append(group)
+
+        return final_groups
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
@@ -415,11 +475,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-to-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        tp = TracePoint("copy-to-main-grad", "Optimizer")
-        tp.begin()
         if not self.is_stub_optimizer:
             self._copy_model_grads_to_main_grads()
-        tp.end()
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
@@ -432,10 +489,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 timers('optimizer-unscale-and-check-inf', log_level=1).start(
                     barrier=self.config.barrier_with_L1_time
                 )
-            tp = TracePoint("unscale-and-check-inf", "Optimizer")
-            tp.begin()
             found_inf_flag = self._unscale_main_grads_and_check_for_nan()
-            tp.end()
             if timers is not None:
                 timers('optimizer-unscale-and-check-inf').stop()
 
@@ -447,33 +501,189 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         return False
 
+    def _inject_optimizer_state_corruption(self):
+        """
+        错误注入方法：直接修改 optimizer state 以测试 DP 组内一致性约束
+        
+        环境变量配置:
+            MEGATRON_INJECT_PARAM_CORRUPTION=1  # 启用注入
+            MEGATRON_CORRUPT_OP=optimizer_state  # 注入类型
+            MEGATRON_CORRUPT_DP_RANK=0           # 目标 DP rank
+            MEGATRON_CORRUPT_STEP=1              # 注入步数
+            MEGATRON_CORRUPT_PARAM_SUBSTR=xxx    # 参数名匹配
+            MEGATRON_OPTIM_STATE_TYPE=momentum   # state 类型
+            MEGATRON_CORRUPT_DELTA=0.01          # 扰动幅度
+        """
+        import os
+        
+        # 检查是否启用注入
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        if inject_enabled != "1":
+            return
+        
+        # 检查注入操作类型
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        if op != "optimizer_state":
+            return
+        
+        # 获取配置
+        try:
+            from vtimeline import MegatronCollector
+            
+            # 获取当前 DP rank
+            if not hasattr(MegatronCollector, 'ranks_info_'):
+                return
+            
+            dp_rank = MegatronCollector.ranks_info_.get("dp")
+            if dp_rank is None:
+                return
+            
+            # 获取当前步数
+            if not hasattr(MegatronCollector, 'step_'):
+                return
+            current_step = MegatronCollector.step_
+            
+            # 获取目标配置
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR")
+            state_type = os.getenv("MEGATRON_OPTIM_STATE_TYPE", "momentum")
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-3"))
+            
+            # 检查是否应该注入
+            if dp_rank != target_dp_rank:
+                return
+            
+            if inject_step != -1 and current_step != inject_step:
+                return
+            
+            print(f"[corrupt-optim] ✓ Starting optimizer state injection", flush=True)
+            print(f"[corrupt-optim]   dp_rank={dp_rank}, step={current_step}", flush=True)
+            print(f"[corrupt-optim]   state_type={state_type}, delta={delta}", flush=True)
+            
+            # 遍历 optimizer state 并注入错误
+            injected_count = 0
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    # 检查参数是否有 state
+                    if p not in self.optimizer.state:
+                        continue
+                    
+                    state = self.optimizer.state[p]
+                    
+                    # 获取参数名称（用于匹配）
+                    param_name = None
+                    if hasattr(p, '_param_name'):
+                        param_name = p._param_name
+                    
+                    # 如果指定了参数匹配，检查是否匹配
+                    if param_substr and param_name:
+                        if param_substr not in param_name:
+                            continue
+                    
+                    # 根据 state_type 修改对应的 state
+                    modified = False
+                    
+                    if state_type == "momentum" or state_type == "exp_avg":
+                        # Adam/AdamW 的 momentum (exp_avg)
+                        if 'exp_avg' in state:
+                            state['exp_avg'].add_(delta)
+                            modified = True
+                            print(f"[corrupt-optim] Modified exp_avg for param {param_name if param_name else 'unknown'}", flush=True)
+                    
+                    elif state_type == "variance" or state_type == "exp_avg_sq":
+                        # Adam/AdamW 的 variance (exp_avg_sq)
+                        if 'exp_avg_sq' in state:
+                            state['exp_avg_sq'].add_(delta)
+                            modified = True
+                            print(f"[corrupt-optim] Modified exp_avg_sq for param {param_name if param_name else 'unknown'}", flush=True)
+                    
+                    elif state_type == "momentum_buffer":
+                        # SGD 的 momentum
+                        if 'momentum_buffer' in state:
+                            state['momentum_buffer'].add_(delta)
+                            modified = True
+                            print(f"[corrupt-optim] Modified momentum_buffer for param {param_name if param_name else 'unknown'}", flush=True)
+                    
+                    elif state_type == "all":
+                        # 修改所有 state
+                        for key in state:
+                            if isinstance(state[key], torch.Tensor):
+                                state[key].add_(delta)
+                                modified = True
+                                print(f"[corrupt-optim] Modified {key} for param {param_name if param_name else 'unknown'}", flush=True)
+                    
+                    if modified:
+                        injected_count += 1
+                        # 如果没有指定参数匹配，只注入第一个
+                        if not param_substr:
+                            break
+                
+                if injected_count > 0 and not param_substr:
+                    break
+            
+            print(f"[corrupt-optim] ✓ Injection completed: {injected_count} states modified", flush=True)
+            
+        except Exception as e:
+            print(f"[corrupt-optim] ✗ Injection failed: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
         timers = self.config.timers
+        
+        # Dump optimizer state before step
+        try:
+            from vtimeline import MegatronCollector
+            MegatronCollector.dump_optimizer_state("optimizer-state-before-step")
+        except Exception as e:
+            pass  # VTimeline may not be available or configured
+        
         # Step the optimizer.
         if timers is not None:
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        tp = TracePoint("inner-step", "Optimizer")
-        tp.begin()
         if not self.is_stub_optimizer:
             self.optimizer.step()
-        tp.end()
         if timers is not None:
             timers('optimizer-inner-step').stop()
+
+        # Dump optimizer state after step (before injection)
+        try:
+            from vtimeline import MegatronCollector
+            MegatronCollector.dump_optimizer_state("optimizer-state-after-step-before-injection")
+        except Exception as e:
+            pass
+
+        # ========================================
+        # 错误注入机制 - Optimizer State 破坏
+        # ========================================
+        # 在 optimizer.step() 之后，直接修改 optimizer state
+        # 用于测试 "DP组内optimizer_state一致性" 约束
+        # ========================================
+        self._inject_optimizer_state_corruption()
+
+        # Dump optimizer state after injection
+        try:
+            from vtimeline import MegatronCollector
+            MegatronCollector.dump_optimizer_state("optimizer-state-after-injection")
+        except Exception as e:
+            pass
 
         # Update params from main params.
         if timers is not None:
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        tp = TracePoint("copy-main-to-model-params", "Optimizer")
-        tp.begin()
         if not self.is_stub_optimizer:
-            self._copy_main_params_to_model_params()
-        tp.end()
+            (
+                self._copy_main_params_to_model_params()
+                if not self.config.reuse_grad_buf_for_mxfp8_param_ag
+                else self._copy_main_params_to_param_buffer()
+            )
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
@@ -492,12 +702,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-clip-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        tp = TracePoint("clip-main-grad", "Optimizer")
-        tp.begin()
         grad_norm = 0.0
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
-        tp.end()
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -506,10 +713,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        tp = TracePoint("count-zeros", "Optimizer")
-        tp.begin()
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
-        tp.end()
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
@@ -693,7 +897,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def sharded_state_dict(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ):
 
         if is_loading:
@@ -748,6 +955,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
+
+        # Filter and reorder param groups to match current optimizer
+        state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
+            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
+        )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Grad scaler.
@@ -891,10 +1103,18 @@ class FP32Optimizer(MegatronOptimizer):
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
+
+        # Filter and reorder param groups to match current optimizer
+        state_dict['param_groups'] = self._filter_and_reorder_param_groups(
+            self.optimizer.param_groups, state_dict['param_groups']
+        )
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
     ):
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
@@ -1160,7 +1380,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
 
         # Count the zeros in the grads.
-        num_zeros_in_grad = self.count_zeros()
+        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
 
         update_successful = self.step_with_ready_grads()
 
@@ -1183,7 +1403,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
                 # needs to be saved.
-                if torch.distributed.get_rank(optimizer.data_parallel_group) == 0:
+                if optimizer.data_parallel_group.rank() == 0:
                     states.append(state_dict)
                     save_states = True
                 else:
@@ -1211,7 +1431,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 continue
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
-            if torch.distributed.get_rank(optimizer.data_parallel_group) == 0 and states is None:
+            if optimizer.data_parallel_group.rank() == 0 and states is None:
                 states = torch.load(filename)
 
             state_dict = states[idx] if states else None
