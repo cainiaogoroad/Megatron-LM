@@ -475,11 +475,19 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             print(f"[corrupt-debug]   - has_step_={has_step}", flush=True)
             
             if has_ranks_info:
-                dp_rank = MegatronCollector.ranks_info_.get("dp_rank")
+                # ✅ 修复：使用正确的键名 "dp", "tp", "pp"
+                dp_rank = MegatronCollector.ranks_info_.get("dp")
+                tp_rank = MegatronCollector.ranks_info_.get("tp") 
+                pp_rank = MegatronCollector.ranks_info_.get("pp")
+                
                 print(f"[corrupt-debug]   - dp_rank={dp_rank}", flush=True)
+                print(f"[corrupt-debug]   - tp_rank={tp_rank}", flush=True)
+                print(f"[corrupt-debug]   - pp_rank={pp_rank}", flush=True)
             else:
                 dp_rank = None
-                print(f"[corrupt-debug]   - dp_rank=None (ranks_info_ not available)", flush=True)
+                tp_rank = None
+                pp_rank = None
+                print(f"[corrupt-debug]   - ranks_info_ not available", flush=True)
             
             if has_model:
                 model_is_none = MegatronCollector.model_ is None
@@ -499,8 +507,16 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             print(f"[corrupt-debug]   - should_inject={should_inject} (inject_step={inject_step}, current_step={current_step})", flush=True)
             
             # 🔍 诊断日志 4: 检查条件
-            rank_match = (dp_rank == target_dp_rank)
+            # 🔍 诊断日志 4: 检查条件
+            # ✅ 修复：确保 dp_rank 不是 None
+            rank_match = (dp_rank is not None and dp_rank == target_dp_rank)
             has_model_check = hasattr(MegatronCollector, 'model_') and MegatronCollector.model_ is not None
+
+            print(f"[corrupt-debug] Condition checks:", flush=True)
+            print(f"[corrupt-debug]   - rank_match={rank_match} (dp_rank={dp_rank}, target={target_dp_rank})", flush=True)
+            print(f"[corrupt-debug]   - has_model_check={has_model_check}", flush=True)
+            print(f"[corrupt-debug]   - should_inject={should_inject}", flush=True)
+            print(f"[corrupt-debug]   - ALL CONDITIONS={rank_match and has_model_check and should_inject}", flush=True)
             
             print(f"[corrupt-debug] Condition checks:", flush=True)
             print(f"[corrupt-debug]   - rank_match={rank_match} (dp_rank={dp_rank}, target={target_dp_rank})", flush=True)
@@ -619,7 +635,9 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             else:
                 # 🔍 诊断日志 7: 条件不满足
                 print(f"[corrupt-debug] ✗ Injection conditions not met", flush=True)
-                if dp_rank != target_dp_rank:
+                if dp_rank is None:
+                    print(f"[corrupt-debug]   - dp_rank is None (ranks_info_ key error, should use 'dp' not 'dp_rank')", flush=True)
+                elif dp_rank != target_dp_rank:
                     print(f"[corrupt-debug]   - Rank mismatch: dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
                 if not (hasattr(MegatronCollector, 'model_') and MegatronCollector.model_):
                     print(f"[corrupt-debug]   - Model not available", flush=True)
