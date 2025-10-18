@@ -437,11 +437,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # 错误注入机制 - 用于测试SDCCheck约束检测系统
     # ========================================
     # 支持的注入方式：
-    #   1. add            - 加法扰动：param += delta
-    #   2. scale          - 缩放扰动：param *= (1 + delta)
-    #   3. zero           - 清零操作：param = 0
-    #   4. reshape        - Shape破坏：改变参数shape（用于测试shape一致性约束）
-    #   5. optimizer_state - Optimizer状态破坏：修改momentum/variance等（用于测试optimizer_state一致性约束）
+    #   1. add       - 加法扰动：param += delta
+    #   2. scale     - 缩放扰动：param *= (1 + delta)
+    #   3. zero      - 清零操作：param = 0
+    #   4. reshape   - Shape破坏：改变参数shape（用于测试shape一致性约束）
     # ========================================
     try:
         import os
@@ -623,39 +622,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                                     print(f"[corrupt] Cannot reshape {name}: insufficient dimensions {original_shape}", flush=True)
                             except Exception as reshape_error:
                                 print(f"[corrupt] Reshape failed for {name}: {reshape_error}", flush=True)
-                        elif op == "optimizer_state":
-                            # 🔴 Optimizer State破坏注入：修改optimizer的momentum/variance等状态
-                            # 用于测试 "model-after-backward阶段DP组内optimizer_state一致性" 约束
-                            print(f"[corrupt] ▶ Entering optimizer_state branch", flush=True)
-                            print(f"[corrupt] Attempting to corrupt optimizer_state for {name} on dp_rank={dp_rank}, step={current_step}", flush=True)
-                            
-                            # 注意：optimizer state 存储在 optimizer 对象中，不在 model 参数中
-                            # 我们需要通过 MegatronCollector 或其他方式访问 optimizer
-                            # 这里我们先标记参数，实际注入需要在 optimizer.step() 中进行
-                            
-                            # 方案1: 直接修改参数的 grad，这会影响 optimizer 的 state 更新
-                            if p.grad is not None:
-                                state_corruption_type = os.getenv("MEGATRON_OPTIM_STATE_TYPE", "momentum")
-                                print(f"[corrupt] Corrupting via grad modification (type={state_corruption_type})", flush=True)
-                                
-                                if state_corruption_type == "momentum":
-                                    # 给梯度添加扰动，会影响 momentum 的累积
-                                    p.grad.add_(delta)
-                                    print(f"[corrupt] CORRUPTED optimizer_state for {name} via grad perturbation (delta={delta}) on dp_rank={dp_rank}", flush=True)
-                                elif state_corruption_type == "scale":
-                                    # 缩放梯度
-                                    p.grad.mul_(1.0 + delta)
-                                    print(f"[corrupt] CORRUPTED optimizer_state for {name} via grad scaling (factor={1.0+delta}) on dp_rank={dp_rank}", flush=True)
-                                elif state_corruption_type == "zero":
-                                    # 清零梯度
-                                    p.grad.zero_()
-                                    print(f"[corrupt] CORRUPTED optimizer_state for {name} via grad zeroing on dp_rank={dp_rank}", flush=True)
-                            else:
-                                print(f"[corrupt] Cannot corrupt optimizer_state for {name}: grad is None", flush=True)
-                                
-                            # 方案2: 如果能访问到 optimizer，直接修改其 state
-                            # 这需要将 optimizer 传递到这里，或通过全局变量访问
-                            # 由于 backward_step 没有 optimizer 参数，我们使用方案1（修改grad）
                         else:
                             print(f"[corrupt] ⚠ Unknown operation: {op}, falling back to add", flush=True)
                             p.add_(delta)  # 回退到 add
