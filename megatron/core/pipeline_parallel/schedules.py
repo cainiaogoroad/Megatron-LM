@@ -445,7 +445,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     try:
         import os
         import torch
-        from megatron_collector import MegatronCollector
+        from vtimeline import MegatronCollector
 
         # 🔍 诊断日志 1: 检查环境变量
         inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
