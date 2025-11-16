@@ -7,14 +7,24 @@ import json
 import torch
 import duckdb
 import hashlib
+import time
 
 
-def _get_cksum(data: torch.Tensor):
-    byte_data = data.detach().cpu().view(torch.uint8).contiguous().numpy().tobytes()
+def _get_cksum_and_timing(data: torch.Tensor):
+    t0 = time.perf_counter()
+    byte_data = (
+        data.detach().cpu().view(torch.uint8).contiguous().numpy().tobytes()
+    )
+    t1 = time.perf_counter()
     hasher = hashlib.sha256()
     hasher.update(byte_data)
+    t2 = time.perf_counter()
 
-    return hasher.hexdigest()
+    return hasher.hexdigest(), (t1 - t0), (t2 - t1), len(byte_data)
+
+
+def _ms(seconds: float) -> int:
+    return int(seconds * 1000)
 
 
 class MegatronCollector:
@@ -40,12 +50,38 @@ class MegatronCollector:
         )
         cls.db_ = duckdb.connect(db_path)
 
+        # Prepare timing file (per-process) to avoid contention
+        timing_path = os.path.join(
+            root_dir,
+            "Collector",
+            "timing_dp{}_tp{}_pp{}_cp{}_pid{}.jsonl".format(
+                cls.ranks_info_["dp"],
+                cls.ranks_info_["tp"],
+                cls.ranks_info_["pp"],
+                cls.ranks_info_["cp"],
+                os.getpid(),
+            ),
+        )
+        try:
+            cls.timing_fp_ = open(timing_path, "a", buffering=1)
+        except Exception:
+            cls.timing_fp_ = None
+
         cls.db_.execute(
             """CREATE TABLE IF NOT EXISTS coredump(
                   step INTEGER,
                   stage TEXT,
                   data JSON);"""
         )
+
+    @classmethod
+    def _write_timing(cls, record: dict):
+        if getattr(cls, "timing_fp_", None) is None:
+            return
+        try:
+            cls.timing_fp_.write(json.dumps(record) + "\n")
+        except Exception:
+            pass
 
     @classmethod
     def set_process_group_info(cls, ranks_info):
@@ -73,18 +109,37 @@ class MegatronCollector:
         if not cls.should_dump():
             return
 
+        cksum, t_copy, t_hash, nbytes = _get_cksum_and_timing(param.main_grad)
         param_info = {
             "name": param_name,
-            "cksum": _get_cksum(param.main_grad),
+            "cksum": cksum,
             "shape": list(param.main_grad.shape),
             "type": str(param.main_grad.type()),
         }
         param_info.update(cls.ranks_info_)
 
         try:
+            t0 = time.perf_counter()
+            payload = json.dumps(param_info)
+            t1 = time.perf_counter()
             cls.db_.execute(
                 "INSERT INTO coredump VALUES (?, ?, ?);",
-                (cls.step_, stage_name, json.dumps(param_info)),
+                (cls.step_, stage_name, payload),
+            )
+            t2 = time.perf_counter()
+            cls._write_timing(
+                {
+                    "step": cls.step_,
+                    "stage": stage_name,
+                    "op": "main_grad",
+                    "name": param_name,
+                    "t_copy_ms": _ms(t_copy),
+                    "t_hash_ms": _ms(t_hash),
+                    "t_json_ms": _ms(t1 - t0),
+                    "t_insert_ms": _ms(t2 - t1),
+                    "size_bytes": len(payload),
+                    "pid": os.getpid(),
+                }
             )
         except Exception as e:
             print(f"Error inserting data into coredump: {e}")
@@ -99,10 +154,17 @@ class MegatronCollector:
                 main_param_exist = (
                     hasattr(param, "main_param") and param.main_param is not None
                 )
-
+                cksum = None
+                t_copy = None
+                t_hash = None
+                nbytes = None
+                if main_param_exist:
+                    cksum, t_copy, t_hash, nbytes = _get_cksum_and_timing(
+                        param.main_param
+                    )
                 param_info = {
                     "name": name,
-                    "cksum": _get_cksum(param.main_param) if main_param_exist else None,
+                    "cksum": cksum if main_param_exist else None,
                     "shape": list(param.main_param.shape) if main_param_exist else None,
                     "type": str(param.main_param.type())
                     if hasattr(param, "main_param") and param.main_param is not None
@@ -110,9 +172,27 @@ class MegatronCollector:
                 }
                 param_info.update(cls.ranks_info_)
                 try:
+                    t0 = time.perf_counter()
+                    payload = json.dumps(param_info)
+                    t1 = time.perf_counter()
                     cls.db_.execute(
                         "INSERT INTO coredump VALUES (?, ?, ?);",
-                        (cls.step_, stage_name, json.dumps(param_info)),
+                        (cls.step_, stage_name, payload),
+                    )
+                    t2 = time.perf_counter()
+                    cls._write_timing(
+                        {
+                            "step": cls.step_,
+                            "stage": stage_name,
+                            "op": "main_param",
+                            "name": name,
+                            "t_copy_ms": _ms(t_copy) if t_copy is not None else None,
+                            "t_hash_ms": _ms(t_hash) if t_hash is not None else None,
+                            "t_json_ms": _ms(t1 - t0),
+                            "t_insert_ms": _ms(t2 - t1),
+                            "size_bytes": len(payload),
+                            "pid": os.getpid(),
+                        }
                     )
                 except Exception as e:
                     print(f"Error inserting data into coredump: {e}")
@@ -124,15 +204,20 @@ class MegatronCollector:
 
         for model in cls.model_:
             for name, param in model.named_parameters():
+                p_cksum, p_t_copy, p_t_hash, p_nbytes = _get_cksum_and_timing(param)
+                g_cksum = None
+                g_t_copy = None
+                g_t_hash = None
+                g_nbytes = None
+                if param.grad is not None:
+                    g_cksum, g_t_copy, g_t_hash, g_nbytes = _get_cksum_and_timing(param.grad)
                 param_info = {
                     "name": name,
-                    "cksum": _get_cksum(param),
+                    "cksum": p_cksum,
                     "shape": list(param.shape),
                     "type": str(param.type()),
                     "requires_grad": param.requires_grad,
-                    "grad_cksum": _get_cksum(param.grad)
-                    if param.grad is not None
-                    else None,
+                    "grad_cksum": g_cksum if param.grad is not None else None,
                     "grad_shape": list(param.grad.shape)
                     if param.grad is not None
                     else None,
@@ -142,9 +227,29 @@ class MegatronCollector:
                 }
                 param_info.update(cls.ranks_info_)
                 try:
+                    t0 = time.perf_counter()
+                    payload = json.dumps(param_info)
+                    t1 = time.perf_counter()
                     cls.db_.execute(
                         "INSERT INTO coredump VALUES (?, ?, ?);",
-                        (cls.step_, stage_name, json.dumps(param_info)),
+                        (cls.step_, stage_name, payload),
+                    )
+                    t2 = time.perf_counter()
+                    cls._write_timing(
+                        {
+                            "step": cls.step_,
+                            "stage": stage_name,
+                            "op": "model_param",
+                            "name": name,
+                            "t_copy_ms": _ms(p_t_copy),
+                            "t_hash_ms": _ms(p_t_hash),
+                            "grad_t_copy_ms": _ms(g_t_copy) if g_t_copy is not None else None,
+                            "grad_t_hash_ms": _ms(g_t_hash) if g_t_hash is not None else None,
+                            "t_json_ms": _ms(t1 - t0),
+                            "t_insert_ms": _ms(t2 - t1),
+                            "size_bytes": len(payload),
+                            "pid": os.getpid(),
+                        }
                     )
                 except Exception as e:
                     print(f"Error inserting data into coredump: {e}")
@@ -159,15 +264,28 @@ class MegatronCollector:
         if not cls.should_dump():
             return
 
-        def _tinfo(t):
+        def _tinfo(name, t):
             if t is None:
                 return None
             try:
+                cksum, t_copy, t_hash, nbytes = _get_cksum_and_timing(t)
+                cls._write_timing(
+                    {
+                        "step": cls.step_,
+                        "stage": stage_name,
+                        "op": "batch_tensor",
+                        "name": name,
+                        "t_copy_ms": _ms(t_copy),
+                        "t_hash_ms": _ms(t_hash),
+                        "bytes": int(nbytes),
+                        "pid": os.getpid(),
+                    }
+                )
                 return {
                     "shape": list(t.shape),
                     "dtype": str(t.dtype),
                     "device": str(t.device),
-                    "cksum": _get_cksum(t),
+                    "cksum": cksum,
                 }
             except Exception:
                 return None
@@ -175,16 +293,31 @@ class MegatronCollector:
         try:
             batch_info = {
                 "type": "batch",
-                "tokens": _tinfo(tokens),
-                "labels": _tinfo(labels),
-                "loss_mask": (lambda info: {**info, "sum": float(loss_mask.sum().item())} if info is not None else None)(_tinfo(loss_mask)),
-                "attention_mask": (lambda info: {**info, "sum": float(attention_mask.sum().item())} if info is not None else None)(_tinfo(attention_mask)),
-                "position_ids": (lambda info: {**info, "min": int(position_ids.min().item()), "max": int(position_ids.max().item())} if info is not None and position_ids.numel() > 0 else info)(_tinfo(position_ids)),
+                "tokens": _tinfo("tokens", tokens),
+                "labels": _tinfo("labels", labels),
+                "loss_mask": (lambda info: {**info, "sum": float(loss_mask.sum().item())} if info is not None else None)(_tinfo("loss_mask", loss_mask)),
+                "attention_mask": (lambda info: {**info, "sum": float(attention_mask.sum().item())} if info is not None else None)(_tinfo("attention_mask", attention_mask)),
+                "position_ids": (lambda info: {**info, "min": int(position_ids.min().item()), "max": int(position_ids.max().item())} if info is not None and position_ids.numel() > 0 else info)(_tinfo("position_ids", position_ids)),
             }
             batch_info.update(cls.ranks_info_)
+            t0 = time.perf_counter()
+            payload = json.dumps(batch_info)
+            t1 = time.perf_counter()
             cls.db_.execute(
                 "INSERT INTO coredump VALUES (?, ?, ?);",
-                (cls.step_, stage_name, json.dumps(batch_info)),
+                (cls.step_, stage_name, payload),
+            )
+            t2 = time.perf_counter()
+            cls._write_timing(
+                {
+                    "step": cls.step_,
+                    "stage": stage_name,
+                    "op": "batch",
+                    "t_json_ms": _ms(t1 - t0),
+                    "t_insert_ms": _ms(t2 - t1),
+                    "size_bytes": len(payload),
+                    "pid": os.getpid(),
+                }
             )
         except Exception as e:
             print(f"Error inserting batch data into coredump: {e}")
