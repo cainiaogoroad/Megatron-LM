@@ -747,6 +747,9 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                                     print(f"[corrupt-dtype] ✗ dtype change failed: {dtype_error}", flush=True)
                             else:
                                 print(f"[corrupt-dtype] ⚠ dtype already matches target, no change needed", flush=True)
+                        elif op in ["requires_grad_before_backward", "cksum_before_backward"]:
+                            # 这些是 backward 前的操作，跳过
+                            print(f"[corrupt] ⚠ Skipping {op} (handled in backward_step before backward)", flush=True)
                         else:
                             print(f"[corrupt] ⚠ Unknown operation: {op}, falling back to add", flush=True)
                             p.add_(delta)  # 回退到 add
