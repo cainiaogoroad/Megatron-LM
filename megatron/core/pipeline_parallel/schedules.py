@@ -622,6 +622,32 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                                     print(f"[corrupt] Cannot reshape {name}: insufficient dimensions {original_shape}", flush=True)
                             except Exception as reshape_error:
                                 print(f"[corrupt] Reshape failed for {name}: {reshape_error}", flush=True)
+                        elif op == "dtype":
+                            # 🔴 dtype 注入：改变参数的数据类型
+                            # 用于测试 DP 组内 dtype 一致性约束
+                            target_dtype_str = os.getenv("MEGATRON_TARGET_DTYPE", "float32")
+                            dtype_map = {
+                                "float32": torch.float32,
+                                "float16": torch.float16,
+                                "bfloat16": torch.bfloat16,
+                            }
+                            target_dtype = dtype_map.get(target_dtype_str, torch.float32)
+                            original_dtype = p.dtype
+                            
+                            print(f"[corrupt-dtype] ▶ Entering dtype branch", flush=True)
+                            print(f"[corrupt-dtype] Changing dtype of {name}", flush=True)
+                            print(f"[corrupt-dtype]   original dtype: {original_dtype}", flush=True)
+                            print(f"[corrupt-dtype]   target dtype: {target_dtype}", flush=True)
+                            
+                            if original_dtype != target_dtype:
+                                try:
+                                    # 转换参数的 dtype
+                                    p.data = p.data.to(target_dtype)
+                                    print(f"[corrupt-dtype] ✓ DTYPE_CHANGED {name}: {original_dtype} -> {target_dtype} on dp_rank={dp_rank}", flush=True)
+                                except Exception as dtype_error:
+                                    print(f"[corrupt-dtype] ✗ dtype change failed: {dtype_error}", flush=True)
+                            else:
+                                print(f"[corrupt-dtype] ⚠ dtype already matches target, no change needed", flush=True)
                         else:
                             print(f"[corrupt] ⚠ Unknown operation: {op}, falling back to add", flush=True)
                             p.add_(delta)  # 回退到 add
