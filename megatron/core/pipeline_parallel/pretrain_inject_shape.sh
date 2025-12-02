@@ -35,7 +35,7 @@ mkdir -p $VTIMELINE_LOGGER_DIR
 export MEGATRON_INJECT_PARAM_CORRUPTION=1
 export MEGATRON_CORRUPT_OP=reshape
 export MEGATRON_CORRUPT_DP_RANK=0
-export MEGATRON_CORRUPT_STEP=0  # 在第0步注入（shape注入越早越好）
+export MEGATRON_CORRUPT_STEP=1  # 在第1步注入（step 0 时 MegatronCollector 可能还未就绪）
 export MEGATRON_CORRUPT_PARAM_SUBSTR="layers.0.mlp.linear_fc1.weight"
 export MEGATRON_RESHAPE_STRATEGY=transpose  # transpose | expand | add_dim
 
