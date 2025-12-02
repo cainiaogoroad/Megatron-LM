@@ -678,7 +678,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     
     # ========================================
-    # 🔴 optimizer_state 注入（在 backward 后）
+    # 🔴 optimizer_state 注入（在 backward 后）a
     # 用于测试约束：backward后DP optimizer_state一致性检查
     # ========================================
     try:
