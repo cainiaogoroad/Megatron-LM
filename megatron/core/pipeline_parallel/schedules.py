@@ -399,6 +399,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # 用于测试约束：backward前DP参数cksum一致性检查
     # ========================================
     try:
+        import os
         from vtimeline import MegatronCollector
         
         inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
