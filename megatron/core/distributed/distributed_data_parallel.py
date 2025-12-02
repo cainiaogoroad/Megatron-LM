@@ -396,6 +396,74 @@ class DistributedDataParallel(_BaseDataParallel):
 
         return hook
 
+    def _inject_main_grad_corruption(self, param: torch.nn.Parameter, param_name: str):
+        """
+        错误注入方法：在反向传播阶段修改 main_grad 以测试 DP 组内梯度一致性约束
+        
+        环境变量配置:
+            MEGATRON_INJECT_PARAM_CORRUPTION=1  # 启用注入
+            MEGATRON_CORRUPT_OP=main_grad       # 注入类型
+            MEGATRON_CORRUPT_DP_RANK=0          # 目标 DP rank
+            MEGATRON_CORRUPT_STEP=1             # 注入步数 (-1 表示所有步)
+            MEGATRON_CORRUPT_PARAM_SUBSTR=xxx   # 参数名匹配模式
+            MEGATRON_CORRUPT_DELTA=0.01         # 扰动幅度
+        """
+        import os
+        
+        # 检查是否启用注入
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        if inject_enabled != "1":
+            return
+        
+        # 检查注入操作类型
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        if op != "main_grad":
+            return
+        
+        # 获取并行状态
+        try:
+            dp_rank = parallel_state.get_data_parallel_rank()
+        except Exception:
+            return
+        
+        # 获取当前步数
+        try:
+            if not hasattr(MegatronCollector, 'step_'):
+                return
+            current_step = MegatronCollector.step_
+        except Exception:
+            return
+        
+        # 获取目标配置
+        target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+        inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+        param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+        delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-3"))
+        
+        # 检查是否应该注入
+        if dp_rank != target_dp_rank:
+            return
+        
+        if inject_step != -1 and current_step != inject_step:
+            return
+        
+        # 检查参数名匹配
+        if param_substr and param_substr not in param_name:
+            return
+        
+        # 检查 main_grad 是否存在
+        if not hasattr(param, 'main_grad') or param.main_grad is None:
+            return
+        
+        # 执行注入
+        try:
+            param.main_grad.add_(delta)
+            print(f"[corrupt-grad] ✓ Injected main_grad corruption", flush=True)
+            print(f"[corrupt-grad]   dp_rank={dp_rank}, step={current_step}", flush=True)
+            print(f"[corrupt-grad]   param={param_name}, delta={delta}", flush=True)
+        except Exception as e:
+            print(f"[corrupt-grad] ✗ Injection failed: {e}", flush=True)
+
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         """
         Creates a backward post-hook to dispatch an all-reduce / reduce-scatter when
@@ -417,6 +485,11 @@ class DistributedDataParallel(_BaseDataParallel):
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
                     param.main_grad.add_(param.grad.data)
+                
+                # ========== 错误注入点：在 dump_main_grad 之前修改梯度 ==========
+                param_name = self.param_to_name.get(param, "unknown")
+                self._inject_main_grad_corruption(param, param_name)
+                
                 MegatronCollector.dump_main_grad(param, self.param_to_name[param], "main-grad-in-backward")
                 param.grad = None
 
