@@ -818,6 +818,66 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     except Exception as e:
         print(f"[corrupt-optim-backward] ✗ Exception: {e}", flush=True)
     
+    # ========================================
+    # 🔴 main_grad cksum 注入（在 backward 后）
+    # 用于测试约束：backward后DP主梯度cksum一致性检查
+    # ========================================
+    try:
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        
+        if inject_enabled == "1" and op == "main_grad_after_backward":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            dp_rank = MegatronCollector.ranks_info_.get('dp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "0.01"))
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-main-grad-after-bwd] MEGATRON_INJECT_PARAM_CORRUPTION=1", flush=True)
+            print(f"[corrupt-main-grad-after-bwd] Configuration:", flush=True)
+            print(f"[corrupt-main-grad-after-bwd]   - op={op}", flush=True)
+            print(f"[corrupt-main-grad-after-bwd]   - dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+            print(f"[corrupt-main-grad-after-bwd]   - current_step={current_step}, inject_step={inject_step}", flush=True)
+            print(f"[corrupt-main-grad-after-bwd]   - param_substr={param_substr}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            # 检查 main_grad 是否存在
+                            if hasattr(p, 'main_grad') and p.main_grad is not None:
+                                p.main_grad.add_(delta)
+                                injected_count += 1
+                                print(f"[corrupt-main-grad-after-bwd] ✓ Modified main_grad for {name} with delta={delta}", flush=True)
+                                if not param_substr:
+                                    break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    print(f"[corrupt-main-grad-after-bwd] ✓ Injection completed: {injected_count} main_grads modified", flush=True)
+                else:
+                    print(f"[corrupt-main-grad-after-bwd] ⚠ MegatronCollector.model_ not available", flush=True)
+            else:
+                print(f"[corrupt-main-grad-after-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+    except Exception as e:
+        print(f"[corrupt-main-grad-after-bwd] ✗ Exception: {e}", flush=True)
+    
+    # Dump main_grad for all parameters (新增，用于检查 main_grad cksum 一致性)
+    try:
+        if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+            for m in MegatronCollector.model_:
+                for name, p in m.named_parameters():
+                    if hasattr(p, 'main_grad') and p.main_grad is not None:
+                        MegatronCollector.dump_main_grad(p, name, "main-grad-after-backward")
+    except Exception:
+        pass
+    
     # Dump optimizer state in backward phase (新增)
     try:
         MegatronCollector.dump_optimizer_state("optimizer-state-after-backward")
