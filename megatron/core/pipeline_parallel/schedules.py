@@ -394,6 +394,61 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if not isinstance(output_tensor_grad, list):
         output_tensor_grad = [output_tensor_grad]
 
+    # ========================================
+    # 🔴 cksum 注入（在 backward 前）
+    # 用于测试约束：backward前DP参数cksum一致性检查
+    # ========================================
+    try:
+        from vtimeline import MegatronCollector
+        
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        
+        if inject_enabled == "1" and op == "cksum_before_backward":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            dp_rank = MegatronCollector.ranks_info_.get('dp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "0.01"))
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-cksum-before-bwd] MEGATRON_INJECT_PARAM_CORRUPTION=1", flush=True)
+            print(f"[corrupt-cksum-before-bwd] Configuration:", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - op={op}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - current_step={current_step}, inject_step={inject_step}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - param_substr={param_substr}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            if p.requires_grad:
+                                # 修改参数值，导致 cksum 不一致
+                                p.data.add_(delta)
+                                injected_count += 1
+                                print(f"[corrupt-cksum-before-bwd] ✓ Modified param {name} with delta={delta}", flush=True)
+                                if not param_substr:
+                                    break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    print(f"[corrupt-cksum-before-bwd] ✓ Injection completed: {injected_count} params modified", flush=True)
+                else:
+                    print(f"[corrupt-cksum-before-bwd] ⚠ MegatronCollector.model_ not available", flush=True)
+            else:
+                print(f"[corrupt-cksum-before-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+        
+        # Dump model state before backward (新增)
+        MegatronCollector.dump_model("model-before-backward")
+    except Exception as e:
+        print(f"[corrupt-cksum-before-bwd] ✗ Exception: {e}", flush=True)
+
     # Backward pass.
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
