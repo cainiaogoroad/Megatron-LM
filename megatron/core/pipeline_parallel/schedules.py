@@ -1084,6 +1084,78 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         print(f"[corrupt-quantile] ✗ Exception: {e}", flush=True)
         import traceback
         traceback.print_exc()
+    
+    # ========== 注入点：分片参数互异性破坏 ==========
+    # 用于测试约束："DP分片参数backward后分片互异性检查"
+    # 注入方式：让分片参数在所有 DP rank 上变成相同的值（违反互异性）
+    try:
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        
+        if inject_enabled == "1" and op == "sharded_same":
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            # 固定值：将分片参数设为这个值，使所有 DP rank 相同
+            fixed_value = float(os.getenv("MEGATRON_CORRUPT_SHARDED_VALUE", "0.0"))
+            
+            current_step = MegatronCollector.step_
+            dp_rank = parallel_state.get_data_parallel_rank()
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-sharded] Configuration:", flush=True)
+            print(f"[corrupt-sharded]   - inject_step={inject_step}", flush=True)
+            print(f"[corrupt-sharded]   - current_step={current_step}", flush=True)
+            print(f"[corrupt-sharded]   - dp_rank={dp_rank}", flush=True)
+            print(f"[corrupt-sharded]   - param_substr={param_substr}", flush=True)
+            print(f"[corrupt-sharded]   - fixed_value={fixed_value}", flush=True)
+            print(f"[corrupt-sharded]   - should_inject={should_inject}", flush=True)
+            
+            if should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    sharded_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            # 检查是否是分片参数（专家参数）
+                            is_sharded = not getattr(p, 'allreduce', True)
+                            
+                            if is_sharded:
+                                sharded_count += 1
+                                if param_substr and param_substr not in name:
+                                    continue
+                                
+                                # 将分片参数设为固定值，使所有 DP rank 相同
+                                with torch.no_grad():
+                                    original_cksum = p.data.view(-1)[:5].tolist() if p.numel() >= 5 else p.data.view(-1).tolist()
+                                    p.data.fill_(fixed_value)
+                                    injected_count += 1
+                                    print(f"[corrupt-sharded] ✓ Set sharded param to fixed value", flush=True)
+                                    print(f"[corrupt-sharded]   param={name}", flush=True)
+                                    print(f"[corrupt-sharded]   dp_rank={dp_rank}", flush=True)
+                                    print(f"[corrupt-sharded]   original_first_5={original_cksum}", flush=True)
+                                    print(f"[corrupt-sharded]   new_value={fixed_value}", flush=True)
+                                    
+                                    if not param_substr:
+                                        break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    
+                    print(f"[corrupt-sharded] Summary:", flush=True)
+                    print(f"[corrupt-sharded]   - Total sharded params found: {sharded_count}", flush=True)
+                    print(f"[corrupt-sharded]   - Params injected: {injected_count}", flush=True)
+                    
+                    if sharded_count == 0:
+                        print(f"[corrupt-sharded] ⚠ No sharded params found (this model may not have expert/MoE layers)", flush=True)
+                        print(f"[corrupt-sharded] ⚠ For testing, you may need to use a MoE model configuration", flush=True)
+                else:
+                    print(f"[corrupt-sharded] ⚠ MegatronCollector.model_ not available", flush=True)
+            else:
+                print(f"[corrupt-sharded] ✗ Conditions not met (should_inject={should_inject})", flush=True)
+    except Exception as e:
+        print(f"[corrupt-sharded] ✗ Exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         
     MegatronCollector.dump_model("model-after-backward")
     MegatronCollector.dump_main_param("main-param-after-backward")
