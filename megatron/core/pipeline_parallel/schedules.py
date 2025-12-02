@@ -1010,6 +1010,80 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         MegatronCollector.dump_optimizer_state("optimizer-state-after-backward")
     except Exception:
         pass  # VTimeline may not have this method configured
+    
+    # ========== 注入点：quantile/极值注入 ==========
+    # 用于测试约束："backward后DP参数分布极值分位数一致性检查"
+    # 注入方式：在特定 DP rank 上修改参数值，使 min/max/quantile 改变
+    try:
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        
+        if inject_enabled == "1" and op == "quantile":
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            # 注入值：将某个元素设为极端值
+            inject_value = float(os.getenv("MEGATRON_CORRUPT_QUANTILE_VALUE", "1e10"))
+            inject_mode = os.getenv("MEGATRON_CORRUPT_QUANTILE_MODE", "max")  # max, min, or outlier
+            
+            current_step = MegatronCollector.step_
+            dp_rank = parallel_state.get_data_parallel_rank()
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-quantile] Configuration:", flush=True)
+            print(f"[corrupt-quantile]   - target_dp_rank={target_dp_rank}", flush=True)
+            print(f"[corrupt-quantile]   - inject_step={inject_step}", flush=True)
+            print(f"[corrupt-quantile]   - current_step={current_step}", flush=True)
+            print(f"[corrupt-quantile]   - dp_rank={dp_rank}", flush=True)
+            print(f"[corrupt-quantile]   - param_substr={param_substr}", flush=True)
+            print(f"[corrupt-quantile]   - inject_value={inject_value}", flush=True)
+            print(f"[corrupt-quantile]   - inject_mode={inject_mode}", flush=True)
+            print(f"[corrupt-quantile]   - should_inject={should_inject}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            if not p.requires_grad:
+                                continue
+                            if p.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                                continue
+                            
+                            # 根据 inject_mode 修改参数
+                            with torch.no_grad():
+                                if inject_mode == "max":
+                                    # 将第一个元素设为极大值，影响 max 和 quantile_75
+                                    p.data.view(-1)[0] = inject_value
+                                elif inject_mode == "min":
+                                    # 将第一个元素设为极小值，影响 min 和 quantile_25
+                                    p.data.view(-1)[0] = -inject_value
+                                elif inject_mode == "outlier":
+                                    # 同时设置极大和极小值
+                                    p.data.view(-1)[0] = inject_value
+                                    if p.numel() > 1:
+                                        p.data.view(-1)[1] = -inject_value
+                                
+                                injected_count += 1
+                                print(f"[corrupt-quantile] ✓ Injected {inject_mode} for {name}", flush=True)
+                                print(f"[corrupt-quantile]   New value at index 0: {p.data.view(-1)[0].item()}", flush=True)
+                                
+                                if not param_substr:
+                                    break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    print(f"[corrupt-quantile] ✓ Injection completed: {injected_count} params modified", flush=True)
+                else:
+                    print(f"[corrupt-quantile] ⚠ MegatronCollector.model_ not available", flush=True)
+            else:
+                print(f"[corrupt-quantile] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+    except Exception as e:
+        print(f"[corrupt-quantile] ✗ Exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         
     MegatronCollector.dump_model("model-after-backward")
     MegatronCollector.dump_main_param("main-param-after-backward")
