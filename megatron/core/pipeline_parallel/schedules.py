@@ -444,6 +444,49 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             else:
                 print(f"[corrupt-cksum-before-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
         
+        # ========================================
+        # 🔴 requires_grad 注入（在 backward 前）
+        # 用于测试约束：backward前DP参数requires_grad一致性检查
+        # ========================================
+        if inject_enabled == "1" and op == "requires_grad_before_backward":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            dp_rank = MegatronCollector.ranks_info_.get('dp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-requires-grad-before-bwd] MEGATRON_INJECT_PARAM_CORRUPTION=1", flush=True)
+            print(f"[corrupt-requires-grad-before-bwd] Configuration:", flush=True)
+            print(f"[corrupt-requires-grad-before-bwd]   - op={op}", flush=True)
+            print(f"[corrupt-requires-grad-before-bwd]   - dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+            print(f"[corrupt-requires-grad-before-bwd]   - current_step={current_step}, inject_step={inject_step}", flush=True)
+            print(f"[corrupt-requires-grad-before-bwd]   - param_substr={param_substr}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            if p.requires_grad:
+                                # 修改 requires_grad 属性，导致不一致
+                                p.requires_grad = False
+                                injected_count += 1
+                                print(f"[corrupt-requires-grad-before-bwd] ✓ Set requires_grad=False for {name}", flush=True)
+                                if not param_substr:
+                                    break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    print(f"[corrupt-requires-grad-before-bwd] ✓ Injection completed: {injected_count} params modified", flush=True)
+                else:
+                    print(f"[corrupt-requires-grad-before-bwd] ⚠ MegatronCollector.model_ not available", flush=True)
+            else:
+                print(f"[corrupt-requires-grad-before-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+        
         # Dump model state before backward (新增)
         MegatronCollector.dump_model("model-before-backward")
     except Exception as e:
