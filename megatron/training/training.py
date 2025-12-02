@@ -1256,6 +1256,86 @@ def dummy_train_step(data_iterator):
         batch = get_batch_on_this_cp_rank(batch)
 
 
+def _inject_requires_grad_corruption(model):
+    """
+    错误注入方法：修改某个参数的 requires_grad 属性以测试 DP 组内一致性约束
+    
+    环境变量配置:
+        MEGATRON_INJECT_PARAM_CORRUPTION=1    # 启用注入
+        MEGATRON_CORRUPT_OP=requires_grad     # 注入类型
+        MEGATRON_CORRUPT_DP_RANK=0            # 目标 DP rank
+        MEGATRON_CORRUPT_STEP=1               # 注入步数 (-1 表示所有步)
+        MEGATRON_CORRUPT_PARAM_SUBSTR=xxx     # 参数名匹配模式
+    """
+    import os
+    
+    # 检查是否启用注入
+    inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+    if inject_enabled != "1":
+        return
+    
+    # 检查注入操作类型
+    op = os.getenv("MEGATRON_CORRUPT_OP", "")
+    if op != "requires_grad":
+        return
+    
+    # 获取并行状态
+    try:
+        from megatron.core import parallel_state
+        dp_rank = parallel_state.get_data_parallel_rank()
+    except Exception:
+        return
+    
+    # 获取当前步数
+    try:
+        from vtimeline import MegatronCollector
+        if not hasattr(MegatronCollector, 'step_'):
+            return
+        current_step = MegatronCollector.step_
+    except Exception:
+        return
+    
+    # 获取目标配置
+    target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+    inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+    param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+    
+    # 检查是否应该注入
+    if dp_rank != target_dp_rank:
+        return
+    
+    if inject_step != -1 and current_step != inject_step:
+        return
+    
+    # 遍历模型参数并注入
+    models = model if isinstance(model, list) else [model]
+    injected_count = 0
+    
+    for m in models:
+        for name, param in m.named_parameters():
+            # 检查参数名匹配
+            if param_substr and param_substr not in name:
+                continue
+            
+            if param.requires_grad:
+                # 修改 requires_grad 为 False
+                param.requires_grad = False
+                injected_count += 1
+                print(f"[corrupt-requires-grad] ✓ Injected requires_grad=False", flush=True)
+                print(f"[corrupt-requires-grad]   dp_rank={dp_rank}, step={current_step}", flush=True)
+                print(f"[corrupt-requires-grad]   param={name}", flush=True)
+                
+                # 如果没有指定参数匹配，只注入第一个
+                if not param_substr:
+                    break
+        
+        if injected_count > 0 and not param_substr:
+            break
+    
+    if injected_count > 0:
+        print(f"[corrupt-requires-grad] ✓ Total injected: {injected_count} params", flush=True)
+
+
 def train_step(forward_step_func, data_iterator,
                model, optimizer, opt_param_scheduler, config):
     """Single training step."""
@@ -1311,6 +1391,10 @@ def train_step(forward_step_func, data_iterator,
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     optimizer_tp = TracePoint("optimizer-step", "Train")
     optimizer_tp.begin()
+    
+    # ========== requires_grad 错误注入点 ==========
+    _inject_requires_grad_corruption(model)
+    
     MegatronCollector.dump_model("model-before-optimizer-step")
     MegatronCollector.dump_main_param("main-param-before-optimizer-step")
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
