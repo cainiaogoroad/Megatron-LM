@@ -676,6 +676,98 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         import traceback
         traceback.print_exc()
 
+    
+    # ========================================
+    # 🔴 optimizer_state 注入（在 backward 后）
+    # 用于测试约束：backward后DP optimizer_state一致性检查
+    # ========================================
+    try:
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        
+        if inject_enabled == "1" and op == "optimizer_state_backward":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            dp_rank = MegatronCollector.ranks_info_.get('dp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            state_type = os.getenv("MEGATRON_OPTIM_STATE_TYPE", "momentum")  # momentum | variance | all
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "0.01"))
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-optim-backward] MEGATRON_INJECT_PARAM_CORRUPTION=1", flush=True)
+            print(f"[corrupt-optim-backward] Configuration:", flush=True)
+            print(f"[corrupt-optim-backward]   - op={op}", flush=True)
+            print(f"[corrupt-optim-backward]   - dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+            print(f"[corrupt-optim-backward]   - current_step={current_step}, inject_step={inject_step}", flush=True)
+            print(f"[corrupt-optim-backward]   - param_substr={param_substr}", flush=True)
+            print(f"[corrupt-optim-backward]   - state_type={state_type}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                # 通过 MegatronCollector 获取 optimizer（在 set_core 时保存）
+                try:
+                    # 遍历 MegatronCollector.model_ 来构建 param_to_name 映射
+                    param_to_name = {}
+                    if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                        for m in MegatronCollector.model_:
+                            for name, param in m.named_parameters():
+                                param_to_name[param] = name
+                    
+                    # 通过 MegatronCollector 获取 optimizer
+                    if hasattr(MegatronCollector, 'optimizer_') and MegatronCollector.optimizer_ is not None:
+                        optimizer = MegatronCollector.optimizer_
+                        
+                        injected_count = 0
+                        for group in optimizer.optimizer.param_groups:
+                            for p in group['params']:
+                                if p not in optimizer.optimizer.state:
+                                    continue
+                                    
+                                state = optimizer.optimizer.state[p]
+                                param_name = param_to_name.get(p, "unknown")
+                                
+                                if param_substr and param_substr not in param_name:
+                                    continue
+                                
+                                modified = False
+                                if state_type in ["momentum", "exp_avg", "all"]:
+                                    if 'exp_avg' in state:
+                                        state['exp_avg'].add_(delta)
+                                        modified = True
+                                        print(f"[corrupt-optim-backward] ✓ Modified exp_avg for {param_name}", flush=True)
+                                
+                                if state_type in ["variance", "exp_avg_sq", "all"]:
+                                    if 'exp_avg_sq' in state:
+                                        state['exp_avg_sq'].add_(delta)
+                                        modified = True
+                                        print(f"[corrupt-optim-backward] ✓ Modified exp_avg_sq for {param_name}", flush=True)
+                                
+                                if modified:
+                                    injected_count += 1
+                                    if not param_substr:
+                                        break
+                            if injected_count > 0 and not param_substr:
+                                break
+                        
+                        print(f"[corrupt-optim-backward] ✓ Injection completed: {injected_count} states modified", flush=True)
+                    else:
+                        print(f"[corrupt-optim-backward] ⚠ MegatronCollector.optimizer_ not available", flush=True)
+                except Exception as optim_error:
+                    print(f"[corrupt-optim-backward] ✗ Failed to access optimizer: {optim_error}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"[corrupt-optim-backward] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+    except Exception as e:
+        print(f"[corrupt-optim-backward] ✗ Exception: {e}", flush=True)
+    
+    # Dump optimizer state in backward phase (新增)
+    try:
+        MegatronCollector.dump_optimizer_state("optimizer-state-after-backward")
+    except Exception:
+        pass  # VTimeline may not have this method configured
         
     MegatronCollector.dump_model("model-after-backward")
     MegatronCollector.dump_main_param("main-param-after-backward")
