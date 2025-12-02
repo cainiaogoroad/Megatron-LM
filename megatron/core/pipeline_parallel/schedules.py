@@ -488,6 +488,86 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             else:
                 print(f"[corrupt-requires-grad-before-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
         
+        # ========================================
+        # 🔴 optimizer_state_dict 注入（在 backward 前）
+        # 用于测试约束：model-before-backward阶段DP optimizer_state_dict全量一致性检查
+        # ========================================
+        if inject_enabled == "1" and op == "optimizer_state_before_backward":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            dp_rank = MegatronCollector.ranks_info_.get('dp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            state_type = os.getenv("MEGATRON_OPTIM_STATE_TYPE", "momentum")  # momentum | variance | all
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "0.01"))
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-optim-state-before-bwd] MEGATRON_INJECT_PARAM_CORRUPTION=1", flush=True)
+            print(f"[corrupt-optim-state-before-bwd] Configuration:", flush=True)
+            print(f"[corrupt-optim-state-before-bwd]   - op={op}", flush=True)
+            print(f"[corrupt-optim-state-before-bwd]   - dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+            print(f"[corrupt-optim-state-before-bwd]   - current_step={current_step}, inject_step={inject_step}", flush=True)
+            print(f"[corrupt-optim-state-before-bwd]   - param_substr={param_substr}", flush=True)
+            print(f"[corrupt-optim-state-before-bwd]   - state_type={state_type}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                # 通过 MegatronCollector 获取 optimizer
+                if hasattr(MegatronCollector, 'optimizer_') and MegatronCollector.optimizer_ is not None:
+                    optimizer = MegatronCollector.optimizer_
+                    
+                    # 构建 param_to_name 映射
+                    param_to_name = {}
+                    if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                        for m in MegatronCollector.model_:
+                            for name, param in m.named_parameters():
+                                param_to_name[param] = name
+                    
+                    injected_count = 0
+                    for group in optimizer.optimizer.param_groups:
+                        for p in group['params']:
+                            if p not in optimizer.optimizer.state:
+                                continue
+                            
+                            state = optimizer.optimizer.state[p]
+                            param_name = param_to_name.get(p, "unknown")
+                            
+                            if param_substr and param_substr not in param_name:
+                                continue
+                            
+                            modified = False
+                            if state_type in ["momentum", "exp_avg", "all"]:
+                                if 'exp_avg' in state:
+                                    state['exp_avg'].add_(delta)
+                                    modified = True
+                                    print(f"[corrupt-optim-state-before-bwd] ✓ Modified exp_avg for {param_name}", flush=True)
+                            
+                            if state_type in ["variance", "exp_avg_sq", "all"]:
+                                if 'exp_avg_sq' in state:
+                                    state['exp_avg_sq'].add_(delta)
+                                    modified = True
+                                    print(f"[corrupt-optim-state-before-bwd] ✓ Modified exp_avg_sq for {param_name}", flush=True)
+                            
+                            if modified:
+                                injected_count += 1
+                                if not param_substr:
+                                    break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    
+                    print(f"[corrupt-optim-state-before-bwd] ✓ Injection completed: {injected_count} states modified", flush=True)
+                else:
+                    print(f"[corrupt-optim-state-before-bwd] ⚠ MegatronCollector.optimizer_ not available", flush=True)
+            else:
+                print(f"[corrupt-optim-state-before-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+        
+        # Dump optimizer state before backward (新增)
+        try:
+            MegatronCollector.dump_optimizer_state("optimizer-state-before-backward")
+        except Exception:
+            pass
+        
         # Dump model state before backward (新增)
         MegatronCollector.dump_model("model-before-backward")
     except Exception as e:
@@ -747,7 +827,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                                     print(f"[corrupt-dtype] ✗ dtype change failed: {dtype_error}", flush=True)
                             else:
                                 print(f"[corrupt-dtype] ⚠ dtype already matches target, no change needed", flush=True)
-                        elif op in ["requires_grad_before_backward", "cksum_before_backward"]:
+                        elif op in ["requires_grad_before_backward", "cksum_before_backward", "optimizer_state_before_backward"]:
                             # 这些是 backward 前的操作，跳过
                             print(f"[corrupt] ⚠ Skipping {op} (handled in backward_step before backward)", flush=True)
                         else:
