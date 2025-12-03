@@ -1336,6 +1336,121 @@ def _inject_requires_grad_corruption(model):
         print(f"[corrupt-requires-grad] ✓ Total injected: {injected_count} params", flush=True)
 
 
+def _inject_higher_order_stats_corruption(model):
+    """
+    错误注入方法：修改参数值以破坏高阶统计量（偏度、峰度）一致性
+    
+    环境变量配置:
+        MEGATRON_INJECT_PARAM_CORRUPTION=1         # 启用注入
+        MEGATRON_CORRUPT_OP=higher_order_stats     # 注入类型
+        MEGATRON_CORRUPT_DP_RANK=0                 # 目标 DP rank
+        MEGATRON_CORRUPT_STEP=1                    # 注入步数 (-1 表示所有步)
+        MEGATRON_CORRUPT_PARAM_SUBSTR=xxx          # 参数名匹配模式
+        MEGATRON_CORRUPT_SKEW_DELTA=0.1            # 偏度修改量
+    """
+    import os
+    import torch
+    
+    # 检查是否启用注入
+    inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+    if inject_enabled != "1":
+        return
+    
+    # 检查注入操作类型
+    op = os.getenv("MEGATRON_CORRUPT_OP", "")
+    if op != "higher_order_stats":
+        return
+    
+    # 获取并行状态
+    try:
+        from megatron.core import parallel_state
+        dp_rank = parallel_state.get_data_parallel_rank()
+    except Exception:
+        return
+    
+    # 获取当前步数
+    try:
+        from vtimeline import MegatronCollector
+        if not hasattr(MegatronCollector, 'step_'):
+            return
+        current_step = MegatronCollector.step_
+    except Exception:
+        return
+    
+    # 获取目标配置
+    target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+    inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+    param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+    skew_delta = float(os.getenv("MEGATRON_CORRUPT_SKEW_DELTA", "0.1"))
+    
+    should_inject = (inject_step == -1 or current_step == inject_step)
+    
+    print(f"[corrupt-higher-order-stats] Configuration:", flush=True)
+    print(f"[corrupt-higher-order-stats]   - target_dp_rank={target_dp_rank}", flush=True)
+    print(f"[corrupt-higher-order-stats]   - inject_step={inject_step}", flush=True)
+    print(f"[corrupt-higher-order-stats]   - current_step={current_step}", flush=True)
+    print(f"[corrupt-higher-order-stats]   - dp_rank={dp_rank}", flush=True)
+    print(f"[corrupt-higher-order-stats]   - param_substr={param_substr}", flush=True)
+    print(f"[corrupt-higher-order-stats]   - skew_delta={skew_delta}", flush=True)
+    print(f"[corrupt-higher-order-stats]   - should_inject={should_inject}", flush=True)
+    
+    # 检查是否应该注入
+    if dp_rank != target_dp_rank:
+        print(f"[corrupt-higher-order-stats] ✗ Rank mismatch: dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+        return
+    
+    if not should_inject:
+        print(f"[corrupt-higher-order-stats] ✗ Step mismatch: current_step={current_step}, inject_step={inject_step}", flush=True)
+        return
+    
+    # 遍历模型参数并注入
+    models = model if isinstance(model, list) else [model]
+    injected_count = 0
+    
+    for m in models:
+        for name, param in m.named_parameters():
+            # 检查参数名匹配
+            if param_substr and param_substr not in name:
+                continue
+            
+            if not param.requires_grad:
+                continue
+            
+            # 修改参数分布以改变偏度和峰度
+            # 策略：对参数的一小部分添加偏移，造成分布不对称
+            with torch.no_grad():
+                flat_param = param.data.view(-1)
+                n = flat_param.numel()
+                
+                # 计算原始统计量
+                original_mean = flat_param.float().mean().item()
+                original_std = flat_param.float().std().item()
+                
+                # 只修改前 10% 的元素，添加偏移以改变偏度
+                modify_count = max(1, n // 10)
+                flat_param[:modify_count].add_(skew_delta)
+                
+                # 计算新的统计量
+                new_mean = flat_param.float().mean().item()
+                new_std = flat_param.float().std().item()
+                
+                injected_count += 1
+                print(f"[corrupt-higher-order-stats] ✓ Modified {name}", flush=True)
+                print(f"[corrupt-higher-order-stats]   original: mean={original_mean:.6f}, std={original_std:.6f}", flush=True)
+                print(f"[corrupt-higher-order-stats]   new: mean={new_mean:.6f}, std={new_std:.6f}", flush=True)
+                print(f"[corrupt-higher-order-stats]   modified {modify_count}/{n} elements", flush=True)
+                
+                # 如果没有指定参数匹配，只注入第一个
+                if not param_substr:
+                    break
+        
+        if injected_count > 0 and not param_substr:
+            break
+    
+    if injected_count > 0:
+        print(f"[corrupt-higher-order-stats] ✓ Total injected: {injected_count} params", flush=True)
+
+
 def train_step(forward_step_func, data_iterator,
                model, optimizer, opt_param_scheduler, config):
     """Single training step."""
@@ -1394,6 +1509,10 @@ def train_step(forward_step_func, data_iterator,
     
     # ========== requires_grad 错误注入点 ==========
     _inject_requires_grad_corruption(model)
+    
+    # ========== 高阶统计量注入点 ==========
+    # 用于测试约束："model-before-optimizer-step阶段DP参数分布高阶统计量一致性检查"
+    _inject_higher_order_stats_corruption(model)
     
     MegatronCollector.dump_model("model-before-optimizer-step")
     MegatronCollector.dump_main_param("main-param-before-optimizer-step")
