@@ -1451,6 +1451,133 @@ def _inject_higher_order_stats_corruption(model):
         print(f"[corrupt-higher-order-stats] ✓ Total injected: {injected_count} params", flush=True)
 
 
+def _inject_optimizer_state_before_optim_step(optimizer):
+    """
+    错误注入方法：在 optimizer step 之前修改 optimizer_state_dict 以破坏 bitwise-level 一致性
+    
+    环境变量配置:
+        MEGATRON_INJECT_PARAM_CORRUPTION=1              # 启用注入
+        MEGATRON_CORRUPT_OP=optimizer_state_before_optim_step  # 注入类型
+        MEGATRON_CORRUPT_DP_RANK=0                      # 目标 DP rank
+        MEGATRON_CORRUPT_STEP=1                         # 注入步数 (-1 表示所有步)
+        MEGATRON_CORRUPT_PARAM_SUBSTR=xxx               # 参数名匹配模式
+        MEGATRON_OPTIM_STATE_TYPE=momentum              # momentum | variance | all
+        MEGATRON_CORRUPT_DELTA=0.01                     # 修改量
+    """
+    import os
+    import torch
+    
+    # 检查是否启用注入
+    inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+    if inject_enabled != "1":
+        return
+    
+    # 检查注入操作类型
+    op = os.getenv("MEGATRON_CORRUPT_OP", "")
+    if op != "optimizer_state_before_optim_step":
+        return
+    
+    # 获取并行状态
+    try:
+        from megatron.core import parallel_state
+        dp_rank = parallel_state.get_data_parallel_rank()
+    except Exception:
+        return
+    
+    # 获取当前步数
+    try:
+        from vtimeline import MegatronCollector
+        if not hasattr(MegatronCollector, 'step_'):
+            return
+        current_step = MegatronCollector.step_
+    except Exception:
+        return
+    
+    # 获取目标配置
+    target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+    inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+    param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+    state_type = os.getenv("MEGATRON_OPTIM_STATE_TYPE", "momentum")  # momentum | variance | all
+    delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "0.01"))
+    
+    should_inject = (inject_step == -1 or current_step == inject_step)
+    
+    print(f"[corrupt-optim-state-before-optim-step] Configuration:", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - target_dp_rank={target_dp_rank}", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - inject_step={inject_step}", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - current_step={current_step}", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - dp_rank={dp_rank}", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - param_substr={param_substr}", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - state_type={state_type}", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - delta={delta}", flush=True)
+    print(f"[corrupt-optim-state-before-optim-step]   - should_inject={should_inject}", flush=True)
+    
+    # 检查是否应该注入
+    if dp_rank != target_dp_rank:
+        print(f"[corrupt-optim-state-before-optim-step] ✗ Rank mismatch: dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+        return
+    
+    if not should_inject:
+        print(f"[corrupt-optim-state-before-optim-step] ✗ Step mismatch: current_step={current_step}, inject_step={inject_step}", flush=True)
+        return
+    
+    # 获取底层 PyTorch optimizer
+    pytorch_optimizer = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    
+    # 遍历 optimizer state 并注入
+    injected_count = 0
+    
+    # 获取 param_to_name 映射
+    param_to_name = {}
+    if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+        for model in MegatronCollector.model_:
+            for name, param in model.named_parameters():
+                param_to_name[id(param)] = name
+                if hasattr(param, 'main_param') and param.main_param is not None:
+                    param_to_name[id(param.main_param)] = name
+    
+    for group in pytorch_optimizer.param_groups:
+        for param in group['params']:
+            if param not in pytorch_optimizer.state:
+                continue
+            
+            state = pytorch_optimizer.state[param]
+            param_name = param_to_name.get(id(param), "unknown")
+            
+            # 检查参数名匹配
+            if param_substr and param_substr not in param_name:
+                continue
+            
+            modified = False
+            
+            # 修改 momentum (exp_avg)
+            if state_type in ["momentum", "exp_avg", "all"]:
+                if 'exp_avg' in state:
+                    with torch.no_grad():
+                        state['exp_avg'].add_(delta)
+                    modified = True
+                    print(f"[corrupt-optim-state-before-optim-step] ✓ Modified exp_avg for {param_name}", flush=True)
+            
+            # 修改 variance (exp_avg_sq)
+            if state_type in ["variance", "exp_avg_sq", "all"]:
+                if 'exp_avg_sq' in state:
+                    with torch.no_grad():
+                        state['exp_avg_sq'].add_(delta)
+                    modified = True
+                    print(f"[corrupt-optim-state-before-optim-step] ✓ Modified exp_avg_sq for {param_name}", flush=True)
+            
+            if modified:
+                injected_count += 1
+                if not param_substr:
+                    break
+        
+        if injected_count > 0 and not param_substr:
+            break
+    
+    if injected_count > 0:
+        print(f"[corrupt-optim-state-before-optim-step] ✓ Total injected: {injected_count} states", flush=True)
+
+
 def train_step(forward_step_func, data_iterator,
                model, optimizer, opt_param_scheduler, config):
     """Single training step."""
@@ -1513,6 +1640,16 @@ def train_step(forward_step_func, data_iterator,
     # ========== 高阶统计量注入点 ==========
     # 用于测试约束："model-before-optimizer-step阶段DP参数分布高阶统计量一致性检查"
     _inject_higher_order_stats_corruption(model)
+    
+    # ========== optimizer_state_dict 注入点 ==========
+    # 用于测试约束："optimizer前DP optimizer_state_dict嵌套状态bitwise-level一致性检查"
+    _inject_optimizer_state_before_optim_step(optimizer)
+    
+    # Dump optimizer state before optimizer step (新增)
+    try:
+        MegatronCollector.dump_optimizer_state("optimizer-state-before-optimizer-step")
+    except Exception:
+        pass  # VTimeline may not have this method configured
     
     MegatronCollector.dump_model("model-before-optimizer-step")
     MegatronCollector.dump_main_param("main-param-before-optimizer-step")
