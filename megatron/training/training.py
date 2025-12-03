@@ -1578,6 +1578,87 @@ def _inject_optimizer_state_before_optim_step(optimizer):
         print(f"[corrupt-optim-state-before-optim-step] ✓ Total injected: {injected_count} states", flush=True)
 
 
+def _inject_lr_corruption(optimizer):
+    """
+    错误注入方法：在 optimizer step 之前修改 optimizer_state_dict.lr 以破坏一致性
+    
+    环境变量配置:
+        MEGATRON_INJECT_PARAM_CORRUPTION=1     # 启用注入
+        MEGATRON_CORRUPT_OP=lr                 # 注入类型
+        MEGATRON_CORRUPT_DP_RANK=0             # 目标 DP rank
+        MEGATRON_CORRUPT_STEP=1                # 注入步数 (-1 表示所有步)
+        MEGATRON_CORRUPT_LR_DELTA=0.001        # lr 修改量
+    """
+    import os
+    
+    # 检查是否启用注入
+    inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+    if inject_enabled != "1":
+        return
+    
+    # 检查注入操作类型
+    op = os.getenv("MEGATRON_CORRUPT_OP", "")
+    if op != "lr":
+        return
+    
+    # 获取并行状态
+    try:
+        from megatron.core import parallel_state
+        dp_rank = parallel_state.get_data_parallel_rank()
+    except Exception:
+        return
+    
+    # 获取当前步数
+    try:
+        from vtimeline import MegatronCollector
+        if not hasattr(MegatronCollector, 'step_'):
+            return
+        current_step = MegatronCollector.step_
+    except Exception:
+        return
+    
+    # 获取目标配置
+    target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+    inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+    lr_delta = float(os.getenv("MEGATRON_CORRUPT_LR_DELTA", "0.001"))
+    
+    should_inject = (inject_step == -1 or current_step == inject_step)
+    
+    print(f"[corrupt-lr] Configuration:", flush=True)
+    print(f"[corrupt-lr]   - target_dp_rank={target_dp_rank}", flush=True)
+    print(f"[corrupt-lr]   - inject_step={inject_step}", flush=True)
+    print(f"[corrupt-lr]   - current_step={current_step}", flush=True)
+    print(f"[corrupt-lr]   - dp_rank={dp_rank}", flush=True)
+    print(f"[corrupt-lr]   - lr_delta={lr_delta}", flush=True)
+    print(f"[corrupt-lr]   - should_inject={should_inject}", flush=True)
+    
+    # 检查是否应该注入
+    if dp_rank != target_dp_rank:
+        print(f"[corrupt-lr] ✗ Rank mismatch: dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+        return
+    
+    if not should_inject:
+        print(f"[corrupt-lr] ✗ Step mismatch: current_step={current_step}, inject_step={inject_step}", flush=True)
+        return
+    
+    # 获取底层 PyTorch optimizer
+    pytorch_optimizer = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    
+    # 修改所有 param_groups 的 lr
+    injected_count = 0
+    for group_idx, group in enumerate(pytorch_optimizer.param_groups):
+        if 'lr' in group:
+            original_lr = group['lr']
+            new_lr = original_lr + lr_delta
+            group['lr'] = new_lr
+            injected_count += 1
+            print(f"[corrupt-lr] ✓ Modified param_group[{group_idx}].lr", flush=True)
+            print(f"[corrupt-lr]   original_lr={original_lr}, new_lr={new_lr}", flush=True)
+    
+    if injected_count > 0:
+        print(f"[corrupt-lr] ✓ Total modified: {injected_count} param_groups", flush=True)
+
+
 def train_step(forward_step_func, data_iterator,
                model, optimizer, opt_param_scheduler, config):
     """Single training step."""
@@ -1644,6 +1725,10 @@ def train_step(forward_step_func, data_iterator,
     # ========== optimizer_state_dict 注入点 ==========
     # 用于测试约束："optimizer前DP optimizer_state_dict嵌套状态bitwise-level一致性检查"
     _inject_optimizer_state_before_optim_step(optimizer)
+    
+    # ========== lr 注入点 ==========
+    # 用于测试约束："optimizer前DP optimizer_state_dict.lr一致性检查"
+    _inject_lr_corruption(optimizer)
     
     # Dump optimizer state before optimizer step (新增)
     try:
