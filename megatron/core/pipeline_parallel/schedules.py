@@ -1261,6 +1261,62 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         print(f"[corrupt-requires-grad-after-bwd] ✗ Exception: {e}", flush=True)
         import traceback
         traceback.print_exc()
+    
+    # ========== 注入点：grad 存在性注入（backward 后） ==========
+    # 用于测试约束："backward后DP参数grad存在性一致性检查"
+    # 注入方式：在特定 DP rank 上将参数的 grad 设为 None
+    try:
+        inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+        op = os.getenv("MEGATRON_CORRUPT_OP", "")
+        
+        if inject_enabled == "1" and op == "grad_existence":
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            
+            current_step = MegatronCollector.step_
+            dp_rank = parallel_state.get_data_parallel_rank()
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-grad-existence] Configuration:", flush=True)
+            print(f"[corrupt-grad-existence]   - target_dp_rank={target_dp_rank}", flush=True)
+            print(f"[corrupt-grad-existence]   - inject_step={inject_step}", flush=True)
+            print(f"[corrupt-grad-existence]   - current_step={current_step}", flush=True)
+            print(f"[corrupt-grad-existence]   - dp_rank={dp_rank}", flush=True)
+            print(f"[corrupt-grad-existence]   - param_substr={param_substr}", flush=True)
+            print(f"[corrupt-grad-existence]   - should_inject={should_inject}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            
+                            if p.requires_grad and p.grad is not None:
+                                # 保存原始 grad 信息
+                                original_grad_shape = list(p.grad.shape)
+                                # 将 grad 设为 None
+                                p.grad = None
+                                injected_count += 1
+                                print(f"[corrupt-grad-existence] ✓ Set grad=None for {name}", flush=True)
+                                print(f"[corrupt-grad-existence]   original_grad_shape={original_grad_shape}", flush=True)
+                                
+                                if not param_substr:
+                                    break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    print(f"[corrupt-grad-existence] ✓ Injection completed: {injected_count} params grad set to None", flush=True)
+                else:
+                    print(f"[corrupt-grad-existence] ⚠ MegatronCollector.model_ not available", flush=True)
+            else:
+                print(f"[corrupt-grad-existence] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+    except Exception as e:
+        print(f"[corrupt-grad-existence] ✗ Exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         
     MegatronCollector.dump_model("model-after-backward")
     MegatronCollector.dump_main_param("main-param-after-backward")
