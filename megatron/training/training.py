@@ -1579,6 +1579,117 @@ def _inject_distribution_shape_corruption(model):
         print(f"[corrupt-distribution-shape] ✓ Total injected: {injected_count} params", flush=True)
 
 
+def _inject_param_bitwise_before_optim_corruption(model):
+    """
+    错误注入方法：在 optimizer step 前修改参数以破坏 bitwise-level 一致性
+    
+    环境变量配置:
+        MEGATRON_INJECT_PARAM_CORRUPTION=1             # 启用注入
+        MEGATRON_CORRUPT_OP=param_bitwise_before_optim # 注入类型
+        MEGATRON_CORRUPT_DP_RANK=0                     # 目标 DP rank
+        MEGATRON_CORRUPT_STEP=2                        # 注入步数 (-1 表示所有步)
+        MEGATRON_CORRUPT_PARAM_SUBSTR=xxx              # 参数名匹配模式
+        MEGATRON_CORRUPT_DELTA=1e-7                    # 修改量（极小值）
+    
+    注入策略：
+        对参数的第一个元素添加极小值，破坏 bitwise 一致性但不影响训练
+    """
+    import os
+    import torch
+    
+    # 检查是否启用注入
+    inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
+    if inject_enabled != "1":
+        return
+    
+    # 检查注入操作类型
+    op = os.getenv("MEGATRON_CORRUPT_OP", "")
+    if op != "param_bitwise_before_optim":
+        return
+    
+    # 获取并行状态
+    try:
+        from megatron.core import parallel_state
+        dp_rank = parallel_state.get_data_parallel_rank()
+    except Exception:
+        return
+    
+    # 获取当前步数
+    try:
+        from vtimeline import MegatronCollector
+        if not hasattr(MegatronCollector, 'step_'):
+            return
+        current_step = MegatronCollector.step_
+    except Exception:
+        return
+    
+    # 获取目标配置
+    target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+    inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+    param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+    delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-7"))
+    
+    should_inject = (inject_step == -1 or current_step == inject_step)
+    
+    print(f"[corrupt-param-bitwise-before-optim] Configuration:", flush=True)
+    print(f"[corrupt-param-bitwise-before-optim]   - target_dp_rank={target_dp_rank}", flush=True)
+    print(f"[corrupt-param-bitwise-before-optim]   - inject_step={inject_step}", flush=True)
+    print(f"[corrupt-param-bitwise-before-optim]   - current_step={current_step}", flush=True)
+    print(f"[corrupt-param-bitwise-before-optim]   - dp_rank={dp_rank}", flush=True)
+    print(f"[corrupt-param-bitwise-before-optim]   - param_substr={param_substr}", flush=True)
+    print(f"[corrupt-param-bitwise-before-optim]   - delta={delta}", flush=True)
+    print(f"[corrupt-param-bitwise-before-optim]   - should_inject={should_inject}", flush=True)
+    
+    # 检查是否应该注入
+    if dp_rank != target_dp_rank:
+        print(f"[corrupt-param-bitwise-before-optim] ✗ Rank mismatch: dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+        return
+    
+    if not should_inject:
+        print(f"[corrupt-param-bitwise-before-optim] ✗ Step mismatch: current_step={current_step}, inject_step={inject_step}", flush=True)
+        return
+    
+    # 遍历模型参数并注入
+    models = model if isinstance(model, list) else [model]
+    injected_count = 0
+    
+    for m in models:
+        for name, param in m.named_parameters():
+            # 检查参数名匹配
+            if param_substr and param_substr not in name:
+                continue
+            
+            if not param.requires_grad:
+                continue
+            
+            # 检查 dtype
+            if param.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                continue
+            
+            # 修改参数的第一个元素以破坏 bitwise 一致性
+            with torch.no_grad():
+                flat_param = param.data.view(-1)
+                original_value = flat_param[0].item()
+                flat_param[0].add_(delta)
+                new_value = flat_param[0].item()
+                
+                injected_count += 1
+                print(f"[corrupt-param-bitwise-before-optim] ✓ Modified {name}", flush=True)
+                print(f"[corrupt-param-bitwise-before-optim]   original[0]={original_value}", flush=True)
+                print(f"[corrupt-param-bitwise-before-optim]   new[0]={new_value}", flush=True)
+                print(f"[corrupt-param-bitwise-before-optim]   delta={delta}", flush=True)
+                
+                # 如果没有指定参数匹配，只注入第一个
+                if not param_substr:
+                    break
+        
+        if injected_count > 0 and not param_substr:
+            break
+    
+    if injected_count > 0:
+        print(f"[corrupt-param-bitwise-before-optim] ✓ Total injected: {injected_count} params", flush=True)
+
+
 def _inject_optimizer_state_before_optim_step(optimizer):
     """
     错误注入方法：在 optimizer step 之前修改 optimizer_state_dict 以破坏 bitwise-level 一致性
@@ -1853,6 +1964,10 @@ def train_step(forward_step_func, data_iterator,
     # ========== 分布形态注入点 ==========
     # 用于测试约束："DP参数分布形态一致性检查"
     _inject_distribution_shape_corruption(model)
+    
+    # ========== 参数 bitwise 注入点 ==========
+    # 用于测试约束："optimizer前DP参数bitwise一致性检查"
+    _inject_param_bitwise_before_optim_corruption(model)
     
     # ========== optimizer_state_dict 注入点 ==========
     # 用于测试约束："optimizer前DP optimizer_state_dict嵌套状态bitwise-level一致性检查"
