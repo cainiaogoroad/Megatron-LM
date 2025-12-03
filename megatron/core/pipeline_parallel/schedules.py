@@ -1264,55 +1264,81 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     
     # ========== 注入点：grad 存在性注入（backward 后） ==========
     # 用于测试约束："backward后DP参数grad存在性一致性检查"
-    # 注入方式：在特定 DP rank 上将参数的 grad 设为 None
+    # 注入方式：在特定 DP rank 上将参数的 main_grad 设为 None
+    # 注意：使用 distributed optimizer 时，grad 会被移到 main_grad，所以需要修改 main_grad
     try:
         inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
         op = os.getenv("MEGATRON_CORRUPT_OP", "")
         
         if inject_enabled == "1" and op == "grad_existence":
-            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
-            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
-            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            # 检查是否已经注入过（使用全局标记）
+            global _grad_existence_injected
+            if '_grad_existence_injected' not in dir():
+                _grad_existence_injected = False
             
-            current_step = MegatronCollector.step_
-            dp_rank = parallel_state.get_data_parallel_rank()
-            
-            should_inject = (inject_step == -1 or current_step == inject_step)
-            
-            print(f"[corrupt-grad-existence] Configuration:", flush=True)
-            print(f"[corrupt-grad-existence]   - target_dp_rank={target_dp_rank}", flush=True)
-            print(f"[corrupt-grad-existence]   - inject_step={inject_step}", flush=True)
-            print(f"[corrupt-grad-existence]   - current_step={current_step}", flush=True)
-            print(f"[corrupt-grad-existence]   - dp_rank={dp_rank}", flush=True)
-            print(f"[corrupt-grad-existence]   - param_substr={param_substr}", flush=True)
-            print(f"[corrupt-grad-existence]   - should_inject={should_inject}", flush=True)
-            
-            if dp_rank == target_dp_rank and should_inject:
-                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
-                    injected_count = 0
-                    for m in MegatronCollector.model_:
-                        for name, p in m.named_parameters():
-                            if param_substr and param_substr not in name:
-                                continue
-                            
-                            if p.requires_grad and p.grad is not None:
-                                # 保存原始 grad 信息
-                                original_grad_shape = list(p.grad.shape)
-                                # 将 grad 设为 None
-                                p.grad = None
-                                injected_count += 1
-                                print(f"[corrupt-grad-existence] ✓ Set grad=None for {name}", flush=True)
-                                print(f"[corrupt-grad-existence]   original_grad_shape={original_grad_shape}", flush=True)
-                                
-                                if not param_substr:
-                                    break
-                        if injected_count > 0 and not param_substr:
-                            break
-                    print(f"[corrupt-grad-existence] ✓ Injection completed: {injected_count} params grad set to None", flush=True)
-                else:
-                    print(f"[corrupt-grad-existence] ⚠ MegatronCollector.model_ not available", flush=True)
+            inject_once = os.getenv("MEGATRON_CORRUPT_ONCE", "0") == "1"
+            if inject_once and _grad_existence_injected:
+                print(f"[corrupt-grad-existence] ⏭ Already injected, skipping", flush=True)
             else:
-                print(f"[corrupt-grad-existence] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+                target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+                inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+                param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+                
+                current_step = MegatronCollector.step_
+                dp_rank = parallel_state.get_data_parallel_rank()
+                
+                should_inject = (inject_step == -1 or current_step == inject_step)
+                
+                print(f"[corrupt-grad-existence] Configuration:", flush=True)
+                print(f"[corrupt-grad-existence]   - target_dp_rank={target_dp_rank}", flush=True)
+                print(f"[corrupt-grad-existence]   - inject_step={inject_step}", flush=True)
+                print(f"[corrupt-grad-existence]   - current_step={current_step}", flush=True)
+                print(f"[corrupt-grad-existence]   - dp_rank={dp_rank}", flush=True)
+                print(f"[corrupt-grad-existence]   - param_substr={param_substr}", flush=True)
+                print(f"[corrupt-grad-existence]   - should_inject={should_inject}", flush=True)
+                print(f"[corrupt-grad-existence]   - inject_once={inject_once}", flush=True)
+                
+                if dp_rank == target_dp_rank and should_inject:
+                    if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                        injected_count = 0
+                        for m in MegatronCollector.model_:
+                            for name, p in m.named_parameters():
+                                if param_substr and param_substr not in name:
+                                    continue
+                                
+                                # 尝试修改 main_grad（distributed optimizer 场景）
+                                if hasattr(p, 'main_grad') and p.main_grad is not None:
+                                    original_grad_shape = list(p.main_grad.shape)
+                                    p.main_grad = None
+                                    injected_count += 1
+                                    print(f"[corrupt-grad-existence] ✓ Set main_grad=None for {name}", flush=True)
+                                    print(f"[corrupt-grad-existence]   original_main_grad_shape={original_grad_shape}", flush=True)
+                                    _grad_existence_injected = True
+                                    
+                                    if not param_substr:
+                                        break
+                                # 尝试修改普通 grad
+                                elif p.requires_grad and p.grad is not None:
+                                    original_grad_shape = list(p.grad.shape)
+                                    p.grad = None
+                                    injected_count += 1
+                                    print(f"[corrupt-grad-existence] ✓ Set grad=None for {name}", flush=True)
+                                    print(f"[corrupt-grad-existence]   original_grad_shape={original_grad_shape}", flush=True)
+                                    _grad_existence_injected = True
+                                    
+                                    if not param_substr:
+                                        break
+                            if injected_count > 0 and not param_substr:
+                                break
+                        
+                        if injected_count > 0:
+                            print(f"[corrupt-grad-existence] ✓ Injection completed: {injected_count} params grad set to None", flush=True)
+                        else:
+                            print(f"[corrupt-grad-existence] ⚠ No grad/main_grad found to inject (grad may have been cleared)", flush=True)
+                    else:
+                        print(f"[corrupt-grad-existence] ⚠ MegatronCollector.model_ not available", flush=True)
+                else:
+                    print(f"[corrupt-grad-existence] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
     except Exception as e:
         print(f"[corrupt-grad-existence] ✗ Exception: {e}", flush=True)
         import traceback
@@ -1326,55 +1352,66 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         op = os.getenv("MEGATRON_CORRUPT_OP", "")
         
         if inject_enabled == "1" and op == "param_bitwise_after_backward":
-            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
-            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
-            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
-            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-7"))
+            # 检查是否已经注入过（使用全局标记）
+            global _param_bitwise_after_bwd_injected
+            if '_param_bitwise_after_bwd_injected' not in dir():
+                _param_bitwise_after_bwd_injected = False
             
-            current_step = MegatronCollector.step_
-            dp_rank = parallel_state.get_data_parallel_rank()
-            
-            should_inject = (inject_step == -1 or current_step == inject_step)
-            
-            print(f"[corrupt-param-bitwise-after-bwd] Configuration:", flush=True)
-            print(f"[corrupt-param-bitwise-after-bwd]   - target_dp_rank={target_dp_rank}", flush=True)
-            print(f"[corrupt-param-bitwise-after-bwd]   - inject_step={inject_step}", flush=True)
-            print(f"[corrupt-param-bitwise-after-bwd]   - current_step={current_step}", flush=True)
-            print(f"[corrupt-param-bitwise-after-bwd]   - dp_rank={dp_rank}", flush=True)
-            print(f"[corrupt-param-bitwise-after-bwd]   - param_substr={param_substr}", flush=True)
-            print(f"[corrupt-param-bitwise-after-bwd]   - delta={delta}", flush=True)
-            print(f"[corrupt-param-bitwise-after-bwd]   - should_inject={should_inject}", flush=True)
-            
-            if dp_rank == target_dp_rank and should_inject:
-                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
-                    import torch
-                    injected_count = 0
-                    for m in MegatronCollector.model_:
-                        for name, p in m.named_parameters():
-                            if param_substr and param_substr not in name:
-                                continue
-                            
-                            if p.requires_grad and p.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                                with torch.no_grad():
-                                    flat_param = p.data.view(-1)
-                                    original_value = flat_param[0].item()
-                                    flat_param[0].add_(delta)
-                                    new_value = flat_param[0].item()
-                                    
-                                    injected_count += 1
-                                    print(f"[corrupt-param-bitwise-after-bwd] ✓ Modified {name}", flush=True)
-                                    print(f"[corrupt-param-bitwise-after-bwd]   original[0]={original_value}", flush=True)
-                                    print(f"[corrupt-param-bitwise-after-bwd]   new[0]={new_value}", flush=True)
-                                    
-                                    if not param_substr:
-                                        break
-                        if injected_count > 0 and not param_substr:
-                            break
-                    print(f"[corrupt-param-bitwise-after-bwd] ✓ Injection completed: {injected_count} params modified", flush=True)
-                else:
-                    print(f"[corrupt-param-bitwise-after-bwd] ⚠ MegatronCollector.model_ not available", flush=True)
+            inject_once = os.getenv("MEGATRON_CORRUPT_ONCE", "0") == "1"
+            if inject_once and _param_bitwise_after_bwd_injected:
+                print(f"[corrupt-param-bitwise-after-bwd] ⏭ Already injected, skipping", flush=True)
             else:
-                print(f"[corrupt-param-bitwise-after-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+                target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+                inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+                param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+                delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-7"))
+                
+                current_step = MegatronCollector.step_
+                dp_rank = parallel_state.get_data_parallel_rank()
+                
+                should_inject = (inject_step == -1 or current_step == inject_step)
+                
+                print(f"[corrupt-param-bitwise-after-bwd] Configuration:", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - target_dp_rank={target_dp_rank}", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - inject_step={inject_step}", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - current_step={current_step}", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - dp_rank={dp_rank}", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - param_substr={param_substr}", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - delta={delta}", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - should_inject={should_inject}", flush=True)
+                print(f"[corrupt-param-bitwise-after-bwd]   - inject_once={inject_once}", flush=True)
+                
+                if dp_rank == target_dp_rank and should_inject:
+                    if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                        import torch
+                        injected_count = 0
+                        for m in MegatronCollector.model_:
+                            for name, p in m.named_parameters():
+                                if param_substr and param_substr not in name:
+                                    continue
+                                
+                                if p.requires_grad and p.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                                    with torch.no_grad():
+                                        flat_param = p.data.view(-1)
+                                        original_value = flat_param[0].item()
+                                        flat_param[0].add_(delta)
+                                        new_value = flat_param[0].item()
+                                        
+                                        injected_count += 1
+                                        _param_bitwise_after_bwd_injected = True
+                                        print(f"[corrupt-param-bitwise-after-bwd] ✓ Modified {name}", flush=True)
+                                        print(f"[corrupt-param-bitwise-after-bwd]   original[0]={original_value}", flush=True)
+                                        print(f"[corrupt-param-bitwise-after-bwd]   new[0]={new_value}", flush=True)
+                                        
+                                        if not param_substr:
+                                            break
+                            if injected_count > 0 and not param_substr:
+                                break
+                        print(f"[corrupt-param-bitwise-after-bwd] ✓ Injection completed: {injected_count} params modified", flush=True)
+                    else:
+                        print(f"[corrupt-param-bitwise-after-bwd] ⚠ MegatronCollector.model_ not available", flush=True)
+                else:
+                    print(f"[corrupt-param-bitwise-after-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
     except Exception as e:
         print(f"[corrupt-param-bitwise-after-bwd] ✗ Exception: {e}", flush=True)
         import traceback

@@ -1898,6 +1898,8 @@ def _inject_lr_corruption(optimizer):
         print(f"[corrupt-lr] ✓ Total modified: {injected_count} param_groups", flush=True)
 
 
+_optim_state_after_step_injected = False
+
 def _inject_optimizer_state_after_step(optimizer):
     """
     错误注入方法：在 optimizer step 之后修改 optimizer_state_dict 以破坏一致性
@@ -1906,11 +1908,13 @@ def _inject_optimizer_state_after_step(optimizer):
         MEGATRON_INJECT_PARAM_CORRUPTION=1         # 启用注入
         MEGATRON_CORRUPT_OP=optim_state_after_step # 注入类型
         MEGATRON_CORRUPT_DP_RANK=0                 # 目标 DP rank
-        MEGATRON_CORRUPT_STEP=2                    # 注入步数 (-1 表示所有步)
+        MEGATRON_CORRUPT_STEP=-1                   # 注入步数 (-1 表示所有步)
         MEGATRON_CORRUPT_PARAM_SUBSTR=xxx          # 参数名匹配模式
         MEGATRON_OPTIM_STATE_TYPE=momentum         # momentum | variance | all
         MEGATRON_CORRUPT_DELTA=0.01                # 修改量
+        MEGATRON_CORRUPT_ONCE=1                    # 只注入一次
     """
+    global _optim_state_after_step_injected
     import os
     import torch
     
@@ -1922,6 +1926,12 @@ def _inject_optimizer_state_after_step(optimizer):
     # 检查注入操作类型
     op = os.getenv("MEGATRON_CORRUPT_OP", "")
     if op != "optim_state_after_step":
+        return
+    
+    # 检查是否已经注入过
+    inject_once = os.getenv("MEGATRON_CORRUPT_ONCE", "0") == "1"
+    if inject_once and _optim_state_after_step_injected:
+        print(f"[corrupt-optim-state-after-step] ⏭ Already injected, skipping", flush=True)
         return
     
     # 获取并行状态
@@ -1958,6 +1968,7 @@ def _inject_optimizer_state_after_step(optimizer):
     print(f"[corrupt-optim-state-after-step]   - state_type={state_type}", flush=True)
     print(f"[corrupt-optim-state-after-step]   - delta={delta}", flush=True)
     print(f"[corrupt-optim-state-after-step]   - should_inject={should_inject}", flush=True)
+    print(f"[corrupt-optim-state-after-step]   - inject_once={inject_once}", flush=True)
     
     # 检查是否应该注入
     if dp_rank != target_dp_rank:
@@ -2009,6 +2020,7 @@ def _inject_optimizer_state_after_step(optimizer):
         
         if modified:
             injected_count += 1
+            _optim_state_after_step_injected = True
             if not param_substr:
                 break
     
