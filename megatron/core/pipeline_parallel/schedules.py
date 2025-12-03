@@ -568,6 +568,56 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         except Exception:
             pass
         
+        # ========================================
+        # 🔴 主权重 bitwise-level 注入（在 backward 前）
+        # 用于测试约束：backward前DP主权重bitwise-level一致性检查
+        # ========================================
+        if inject_enabled == "1" and op == "cksum_before_backward":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            dp_rank = MegatronCollector.ranks_info_.get('dp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_dp_rank = int(os.getenv("MEGATRON_CORRUPT_DP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "")
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1e-7"))  # 极小值，破坏 bitwise 一致性
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-cksum-before-bwd] Configuration:", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - op={op}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - dp_rank={dp_rank}, target={target_dp_rank}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - current_step={current_step}, inject_step={inject_step}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - param_substr={param_substr}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - delta={delta}", flush=True)
+            print(f"[corrupt-cksum-before-bwd]   - should_inject={should_inject}", flush=True)
+            
+            if dp_rank == target_dp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            
+                            # 修改参数值以破坏 bitwise 一致性
+                            with torch.no_grad():
+                                original_first = p.data.view(-1)[0].item()
+                                p.data.add_(delta)
+                                new_first = p.data.view(-1)[0].item()
+                                injected_count += 1
+                                print(f"[corrupt-cksum-before-bwd] ✓ Modified param {name}", flush=True)
+                                print(f"[corrupt-cksum-before-bwd]   original[0]={original_first}, new[0]={new_first}", flush=True)
+                                
+                                if not param_substr:
+                                    break
+                        if injected_count > 0 and not param_substr:
+                            break
+                    print(f"[corrupt-cksum-before-bwd] ✓ Injection completed: {injected_count} params modified", flush=True)
+                else:
+                    print(f"[corrupt-cksum-before-bwd] ⚠ MegatronCollector.model_ not available", flush=True)
+            else:
+                print(f"[corrupt-cksum-before-bwd] ✗ Conditions not met (rank_match={dp_rank == target_dp_rank}, should_inject={should_inject})", flush=True)
+        
         # Dump model state before backward (新增)
         MegatronCollector.dump_model("model-before-backward")
     except Exception as e:
