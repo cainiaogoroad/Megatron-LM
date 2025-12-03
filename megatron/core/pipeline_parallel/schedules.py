@@ -880,6 +880,9 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                         elif op in ["requires_grad_before_backward", "cksum_before_backward", "optimizer_state_before_backward"]:
                             # 这些是 backward 前的操作，跳过
                             print(f"[corrupt] ⚠ Skipping {op} (handled in backward_step before backward)", flush=True)
+                        elif op in ["optim_state_after_step", "grad_existence", "param_bitwise_after_backward"]:
+                            # 这些操作在 training.py 或其他位置专门处理，跳过
+                            print(f"[corrupt] ⚠ Skipping {op} (handled elsewhere)", flush=True)
                         else:
                             print(f"[corrupt] ⚠ Unknown operation: {op}, falling back to add", flush=True)
                             p.add_(delta)  # 回退到 add

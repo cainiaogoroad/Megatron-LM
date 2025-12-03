@@ -1980,7 +1980,17 @@ def _inject_optimizer_state_after_step(optimizer):
         return
     
     # 获取底层 PyTorch optimizer
-    pytorch_optimizer = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    # DistributedOptimizer 的结构: optimizer.optimizer 是 MixedPrecisionOptimizer
+    # MixedPrecisionOptimizer.optimizer 是实际的 PyTorch optimizer (如 Adam)
+    pytorch_optimizer = optimizer
+    if hasattr(optimizer, 'optimizer'):
+        pytorch_optimizer = optimizer.optimizer
+    if hasattr(pytorch_optimizer, 'optimizer'):
+        pytorch_optimizer = pytorch_optimizer.optimizer
+    
+    print(f"[corrupt-optim-state-after-step] Optimizer type: {type(optimizer).__name__}", flush=True)
+    print(f"[corrupt-optim-state-after-step] PyTorch optimizer type: {type(pytorch_optimizer).__name__}", flush=True)
+    print(f"[corrupt-optim-state-after-step] State dict keys count: {len(pytorch_optimizer.state)}", flush=True)
     
     # 获取模型参数名映射
     param_to_name = {}
@@ -1990,32 +2000,44 @@ def _inject_optimizer_state_after_step(optimizer):
             for model in MegatronCollector.model_:
                 for name, param in model.named_parameters():
                     param_to_name[id(param)] = name
-    except Exception:
-        pass
+            print(f"[corrupt-optim-state-after-step] Param name mapping count: {len(param_to_name)}", flush=True)
+    except Exception as e:
+        print(f"[corrupt-optim-state-after-step] ⚠ Failed to get param names: {e}", flush=True)
     
     # 遍历 optimizer state 并注入
     injected_count = 0
+    scanned_count = 0
+    matched_count = 0
+    
     for param, state in pytorch_optimizer.state.items():
+        scanned_count += 1
         param_name = param_to_name.get(id(param), f"param_{id(param)}")
         
         # 检查参数名匹配
         if param_substr and param_substr not in param_name:
             continue
         
+        matched_count += 1
         modified = False
         
         # 修改 exp_avg (动量)
         if state_type in ('momentum', 'all') and 'exp_avg' in state:
             with torch.no_grad():
-                state['exp_avg'].data[0].add_(delta)
+                original_val = state['exp_avg'].data.view(-1)[0].item()
+                state['exp_avg'].data.view(-1)[0].add_(delta)
+                new_val = state['exp_avg'].data.view(-1)[0].item()
             print(f"[corrupt-optim-state-after-step] ✓ Modified exp_avg for {param_name}", flush=True)
+            print(f"[corrupt-optim-state-after-step]   original[0]={original_val}, new[0]={new_val}", flush=True)
             modified = True
         
         # 修改 exp_avg_sq (二阶矩)
         if state_type in ('variance', 'all') and 'exp_avg_sq' in state:
             with torch.no_grad():
-                state['exp_avg_sq'].data[0].add_(delta)
+                original_val = state['exp_avg_sq'].data.view(-1)[0].item()
+                state['exp_avg_sq'].data.view(-1)[0].add_(delta)
+                new_val = state['exp_avg_sq'].data.view(-1)[0].item()
             print(f"[corrupt-optim-state-after-step] ✓ Modified exp_avg_sq for {param_name}", flush=True)
+            print(f"[corrupt-optim-state-after-step]   original[0]={original_val}, new[0]={new_val}", flush=True)
             modified = True
         
         if modified:
@@ -2024,8 +2046,12 @@ def _inject_optimizer_state_after_step(optimizer):
             if not param_substr:
                 break
     
+    print(f"[corrupt-optim-state-after-step] Scan summary: scanned={scanned_count}, matched={matched_count}, injected={injected_count}", flush=True)
+    
     if injected_count > 0:
         print(f"[corrupt-optim-state-after-step] ✓ Injection completed: {injected_count} param states modified", flush=True)
+    else:
+        print(f"[corrupt-optim-state-after-step] ⚠ No injection occurred (no matching params or no state)", flush=True)
 
 
 def train_step(forward_step_func, data_iterator,

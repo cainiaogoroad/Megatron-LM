@@ -561,6 +561,21 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             print(f"[corrupt-optim]   dp_rank={dp_rank}, step={current_step}", flush=True)
             print(f"[corrupt-optim]   state_type={state_type}, delta={delta}", flush=True)
             
+            # 构建参数名称映射（从 MegatronCollector 的 model）
+            param_to_name = {}
+            if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                for model in MegatronCollector.model_:
+                    for name, param in model.named_parameters():
+                        # 建立从 param id 到 name 的映射
+                        param_to_name[id(param)] = name
+                        # 如果有 main_param，也建立映射
+                        if hasattr(param, 'main_param') and param.main_param is not None:
+                            param_to_name[id(param.main_param)] = name
+            
+            print(f"[corrupt-optim] Built param_to_name mapping with {len(param_to_name)} entries", flush=True)
+            if param_substr:
+                print(f"[corrupt-optim] Filtering for params containing: '{param_substr}'", flush=True)
+            
             # 遍历 optimizer state 并注入错误
             injected_count = 0
             for group in self.optimizer.param_groups:
@@ -571,14 +586,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                     
                     state = self.optimizer.state[p]
                     
-                    # 获取参数名称（用于匹配）
-                    param_name = None
-                    if hasattr(p, '_param_name'):
-                        param_name = p._param_name
+                    # 获取参数名称（用于匹配和日志）
+                    param_name = param_to_name.get(id(p), None)
                     
                     # 如果指定了参数匹配，检查是否匹配
-                    if param_substr and param_name:
-                        if param_substr not in param_name:
+                    if param_substr:
+                        if not param_name or param_substr not in param_name:
                             continue
                     
                     # 根据 state_type 修改对应的 state
