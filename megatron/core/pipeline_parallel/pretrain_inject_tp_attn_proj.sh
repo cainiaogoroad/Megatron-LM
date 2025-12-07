@@ -63,6 +63,7 @@ python -m torch.distributed.run \
     --eval-iters 10 \
     --eval-interval 100 \
     --mock-data \
+    --tokenizer-type NullTokenizer \
     --vocab-size 50304 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
