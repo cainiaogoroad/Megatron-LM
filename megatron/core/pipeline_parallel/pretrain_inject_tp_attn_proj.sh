@@ -122,35 +122,48 @@ for db_file in db_files:
     db_path = f"{db_dir}/{db_file}"
     conn = duckdb.connect(db_path, read_only=True)
     
+    # 首先检查可用的 stages
+    stages_result = conn.execute('''
+        SELECT DISTINCT stage FROM coredump
+    ''').fetchall()
+    available_stages = [r[0] for r in stages_result]
+    print(f"  可用 stages: {available_stages}")
+    
+    # 检查有哪些参数
+    params_result = conn.execute('''
+        SELECT DISTINCT json_extract_string(data, '$.name') as name
+        FROM coredump 
+        WHERE json_extract_string(data, '$.name') LIKE '%linear_proj%'
+        LIMIT 5
+    ''').fetchall()
+    print(f"  linear_proj 参数: {[r[0] for r in params_result]}")
+    
+    # 使用更宽松的查询
     result = conn.execute('''
         SELECT
             step,
+            stage,
             json_extract(data, '$.name') as name,
-            json_extract(data, '$.cksum') as cksum,
-            json_extract(data, '$.min') as param_min,
-            json_extract(data, '$.max') as param_max
+            json_extract(data, '$.cksum') as cksum
         FROM coredump
-        WHERE stage = 'model-after-backward'
-        AND (
-            json_extract_string(data, '$.name') LIKE '%linear_proj%weight%'
-            OR json_extract_string(data, '$.name') LIKE '%attention%dense%weight%'
-        )
+        WHERE json_extract_string(data, '$.name') LIKE '%linear_proj%weight%'
         AND step = 2
         ORDER BY name
         LIMIT 10
     ''').fetchall()
     
-    print(f"  attention output projection 参数 (step=2):")
+    print(f"  linear_proj.weight 参数 (step=2):")
+    if not result:
+        print(f"    ⚠️  未找到数据")
     for row in result:
-        step, name, cksum, param_min, param_max = row
-        print(f"    name={name}")
-        print(f"      cksum={cksum}, min={param_min}, max={param_max}")
+        step, stage, name, cksum = row
+        print(f"    stage={stage}, name={name}, cksum={cksum}")
         
         clean_name = name.strip('"') if name else name
         key = (clean_name, step)
         if key not in attn_proj_data:
             attn_proj_data[key] = {}
-        attn_proj_data[key][tp_rank] = {'cksum': cksum, 'min': param_min, 'max': param_max}
+        attn_proj_data[key][tp_rank] = cksum
     
     conn.close()
 
@@ -160,6 +173,9 @@ print("========================================\n")
 
 if not attn_proj_data:
     print("❌ 无法比对：未找到 attention output projection 数据")
+    print("   可能原因：")
+    print("   1. VTimeline 未 dump model-after-backward 阶段数据")
+    print("   2. 参数名称不匹配")
     sys.exit(1)
 
 mismatch_count = 0
@@ -170,12 +186,12 @@ for key in sorted(attn_proj_data.keys()):
     tp_data = attn_proj_data[key]
     
     if len(tp_data) >= 2:
-        cksums = [tp_data[tp]['cksum'] for tp in tp_data]
+        cksums = [tp_data[tp] for tp in tp_data]
         if len(set(str(c) for c in cksums)) > 1:
             mismatch_count += 1
             print(f"❌ 不一致: {name}")
-            for tp, stats in sorted(tp_data.items()):
-                print(f"   TP{tp}: cksum={stats['cksum']}, min={stats['min']}, max={stats['max']}")
+            for tp, ck in sorted(tp_data.items()):
+                print(f"   TP{tp}: cksum={ck}")
         else:
             match_count += 1
 

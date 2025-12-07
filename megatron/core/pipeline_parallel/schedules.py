@@ -400,6 +400,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # ========================================
     try:
         import os
+        import torch
         from vtimeline import MegatronCollector
         
         inject_enabled = os.getenv("MEGATRON_INJECT_PARAM_CORRUPTION", "0")
@@ -921,6 +922,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             
             print(f"[corrupt-tp-attn-proj] Configuration:", flush=True)
             print(f"[corrupt-tp-attn-proj]   - tp_rank={tp_rank}, target={target_tp_rank}", flush=True)
+            print(f"[corrupt-tp-attn-proj]   - current_step={current_step}, inject_step={inject_step}", flush=True)
+            print(f"[corrupt-tp-attn-proj]   - should_inject={should_inject}, delta={delta}", flush=True)
             
             if tp_rank == target_tp_rank and should_inject:
                 if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
@@ -935,7 +938,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                                     print(f"[corrupt-tp-attn-proj] ✓ Modified {name} on tp_rank={tp_rank}", flush=True)
                     print(f"[corrupt-tp-attn-proj] ✓ Injection completed: {injected_count} params modified", flush=True)
             else:
-                print(f"[corrupt-tp-attn-proj] ✗ Conditions not met", flush=True)
+                print(f"[corrupt-tp-attn-proj] ✗ Conditions not met (tp_match={tp_rank == target_tp_rank}, should_inject={should_inject})", flush=True)
         
         # TP 约束 11: optimizer state 边界 NaN 注入
         if inject_enabled == "1" and op == "tp_optim_state_nan":
