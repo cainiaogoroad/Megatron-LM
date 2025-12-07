@@ -1210,7 +1210,16 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             print(f"[corrupt-debug]   - should_inject={should_inject}", flush=True)
             print(f"[corrupt-debug]   - ALL CONDITIONS={rank_match and has_model_check and should_inject}", flush=True)
             
-            if dp_rank == target_dp_rank and MegatronCollector.model_ and should_inject:
+            # 跳过 TP 专用操作（这些操作有专门的注入逻辑）
+            tp_specific_ops = ["tp_layernorm", "tp_router", "tp_requires_grad", "tp_main_grad", 
+                              "tp_grad_nan", "tp_optim_state", "tp_qkv_distribution", "tp_attn_proj",
+                              "tp_optim_state_nan", "tp_qkv_boundary_jump", "tp_grad_boundary_jump",
+                              "tp_layernorm_bias", "tp_grad_distribution", "tp_embedding",
+                              "tp_mlp_fc1", "tp_grad_same", "tp_shared_experts_same"]
+            
+            if op in tp_specific_ops:
+                print(f"[corrupt-debug] ⏭️ Skipping generic injection for TP-specific op: {op}", flush=True)
+            elif dp_rank == target_dp_rank and MegatronCollector.model_ and should_inject:
                 print(f"[corrupt-debug] ✓ All conditions passed, proceeding with injection", flush=True)
                 
                 # 重新读取配置（避免被之前的print覆盖）

@@ -19,6 +19,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 # 数据库输出目录
 export VTIMELINE_LOGGER_DIR="${MEGATRON_ROOT}/tp_layernorm_test_db"
+export VTIMELINE_DUMP_STEP=10  # 启用 VTimeline 数据收集
 rm -rf "${VTIMELINE_LOGGER_DIR}"
 mkdir -p "${VTIMELINE_LOGGER_DIR}"
 

@@ -19,6 +19,7 @@ export PYTHONPATH="${VTIMELINE_ROOT}/src:${MEGATRON_ROOT}:${PYTHONPATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 export VTIMELINE_LOGGER_DIR="${MEGATRON_ROOT}/tp_shared_experts_same_test_db"
+export VTIMELINE_DUMP_STEP=10  # 启用 VTimeline 数据收集
 rm -rf "${VTIMELINE_LOGGER_DIR}"
 mkdir -p "${VTIMELINE_LOGGER_DIR}"
 
