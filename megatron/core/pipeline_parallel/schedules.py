@@ -974,6 +974,105 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                     print(f"[corrupt-tp-optim-state-nan] ✓ Injection completed: {injected_count} states modified", flush=True)
             else:
                 print(f"[corrupt-tp-optim-state-nan] ✗ Conditions not met", flush=True)
+        
+        # ========================================
+        # 🔵 更多 TP 约束注入（第二批）
+        # ========================================
+        
+        # TP 约束 12: qkv.weight 拼接边界跳变注入
+        if inject_enabled == "1" and op == "tp_qkv_boundary_jump":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            tp_rank = MegatronCollector.ranks_info_.get('tp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_tp_rank = int(os.getenv("MEGATRON_CORRUPT_TP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            jump_value = float(os.getenv("MEGATRON_CORRUPT_JUMP_VALUE", "100.0"))  # 极端跳变值
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-tp-qkv-boundary] Configuration:", flush=True)
+            print(f"[corrupt-tp-qkv-boundary]   - tp_rank={tp_rank}, target={target_tp_rank}", flush=True)
+            print(f"[corrupt-tp-qkv-boundary]   - jump_value={jump_value}", flush=True)
+            
+            if tp_rank == target_tp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if 'qkv' in name.lower() and 'weight' in name.lower():
+                                with torch.no_grad():
+                                    # 在边界处（最后几个元素）注入极端跳变
+                                    flat_p = p.data.view(-1)
+                                    flat_p[-1] = jump_value
+                                    flat_p[-2] = -jump_value
+                                    injected_count += 1
+                                    print(f"[corrupt-tp-qkv-boundary] ✓ Injected boundary jump into {name}", flush=True)
+                                    break
+                        if injected_count > 0:
+                            break
+                    print(f"[corrupt-tp-qkv-boundary] ✓ Injection completed: {injected_count} params modified", flush=True)
+            else:
+                print(f"[corrupt-tp-qkv-boundary] ✗ Conditions not met", flush=True)
+        
+        # TP 约束 13: LayerNorm.bias 分布一致性检查
+        if inject_enabled == "1" and op == "tp_layernorm_bias":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            tp_rank = MegatronCollector.ranks_info_.get('tp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_tp_rank = int(os.getenv("MEGATRON_CORRUPT_TP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "5.0"))  # 大幅偏移以改变分布
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-tp-layernorm-bias] Configuration:", flush=True)
+            print(f"[corrupt-tp-layernorm-bias]   - tp_rank={tp_rank}, target={target_tp_rank}", flush=True)
+            print(f"[corrupt-tp-layernorm-bias]   - delta={delta}", flush=True)
+            
+            if tp_rank == target_tp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if ('layer_norm' in name.lower() or 'layernorm' in name.lower()) and 'bias' in name.lower():
+                                with torch.no_grad():
+                                    p.data.add_(delta)
+                                    injected_count += 1
+                                    print(f"[corrupt-tp-layernorm-bias] ✓ Modified {name} on tp_rank={tp_rank}", flush=True)
+                    print(f"[corrupt-tp-layernorm-bias] ✓ Injection completed: {injected_count} params modified", flush=True)
+            else:
+                print(f"[corrupt-tp-layernorm-bias] ✗ Conditions not met", flush=True)
+        
+        # TP 约束 14: qkv.weight.grad 分布统计一致性检查（在 backward 之后注入）
+        # 注意：这个在 backward 后处理
+        
+        # TP 约束 15: embedding 权重一致性检查（embedding 在 TP 组间应该相同）
+        if inject_enabled == "1" and op == "tp_embedding":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            tp_rank = MegatronCollector.ranks_info_.get('tp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_tp_rank = int(os.getenv("MEGATRON_CORRUPT_TP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "0.01"))
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-tp-embedding] Configuration:", flush=True)
+            print(f"[corrupt-tp-embedding]   - tp_rank={tp_rank}, target={target_tp_rank}", flush=True)
+            
+            if tp_rank == target_tp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if 'embedding' in name.lower() and 'weight' in name.lower():
+                                with torch.no_grad():
+                                    p.data.add_(delta)
+                                    injected_count += 1
+                                    print(f"[corrupt-tp-embedding] ✓ Modified {name} on tp_rank={tp_rank}", flush=True)
+                    print(f"[corrupt-tp-embedding] ✓ Injection completed: {injected_count} params modified", flush=True)
+            else:
+                print(f"[corrupt-tp-embedding] ✗ Conditions not met", flush=True)
     
     except Exception as e:
         print(f"[corrupt-cksum-before-bwd] ✗ Exception: {e}", flush=True)
@@ -1862,6 +1961,79 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
                     print(f"[corrupt-tp-main-grad] ✓ Injection completed: {injected_count} main_grads modified", flush=True)
             else:
                 print(f"[corrupt-tp-main-grad] ✗ Conditions not met", flush=True)
+        
+        # TP 约束: qkv.weight.grad 边界跳变注入（backward 后）
+        if inject_enabled == "1" and op == "tp_grad_boundary_jump":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            tp_rank = MegatronCollector.ranks_info_.get('tp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_tp_rank = int(os.getenv("MEGATRON_CORRUPT_TP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            jump_value = float(os.getenv("MEGATRON_CORRUPT_JUMP_VALUE", "100.0"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "qkv")
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-tp-grad-boundary] Configuration:", flush=True)
+            print(f"[corrupt-tp-grad-boundary]   - tp_rank={tp_rank}, target={target_tp_rank}", flush=True)
+            print(f"[corrupt-tp-grad-boundary]   - jump_value={jump_value}", flush=True)
+            
+            if tp_rank == target_tp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            if p.grad is not None:
+                                with torch.no_grad():
+                                    flat_grad = p.grad.view(-1)
+                                    flat_grad[-1] = jump_value
+                                    flat_grad[-2] = -jump_value
+                                    injected_count += 1
+                                    print(f"[corrupt-tp-grad-boundary] ✓ Injected boundary jump into {name}.grad", flush=True)
+                                    break
+                        if injected_count > 0:
+                            break
+                    print(f"[corrupt-tp-grad-boundary] ✓ Injection completed: {injected_count} grads modified", flush=True)
+            else:
+                print(f"[corrupt-tp-grad-boundary] ✗ Conditions not met", flush=True)
+        
+        # TP 约束: qkv.weight.grad 分布统计一致性检查
+        if inject_enabled == "1" and op == "tp_grad_distribution":
+            current_step = MegatronCollector.step_ if hasattr(MegatronCollector, 'step_') else 0
+            tp_rank = MegatronCollector.ranks_info_.get('tp', 0) if hasattr(MegatronCollector, 'ranks_info_') else 0
+            
+            target_tp_rank = int(os.getenv("MEGATRON_CORRUPT_TP_RANK", "0"))
+            inject_step = int(os.getenv("MEGATRON_CORRUPT_STEP", "-1"))
+            delta = float(os.getenv("MEGATRON_CORRUPT_DELTA", "1.0"))
+            param_substr = os.getenv("MEGATRON_CORRUPT_PARAM_SUBSTR", "qkv")
+            
+            should_inject = (inject_step == -1 or current_step == inject_step)
+            
+            print(f"[corrupt-tp-grad-distribution] Configuration:", flush=True)
+            print(f"[corrupt-tp-grad-distribution]   - tp_rank={tp_rank}, target={target_tp_rank}", flush=True)
+            print(f"[corrupt-tp-grad-distribution]   - delta={delta}", flush=True)
+            
+            if tp_rank == target_tp_rank and should_inject:
+                if hasattr(MegatronCollector, 'model_') and MegatronCollector.model_:
+                    injected_count = 0
+                    for m in MegatronCollector.model_:
+                        for name, p in m.named_parameters():
+                            if param_substr and param_substr not in name:
+                                continue
+                            if p.grad is not None:
+                                with torch.no_grad():
+                                    # 大幅偏移梯度以改变分布统计特征
+                                    p.grad.add_(delta)
+                                    injected_count += 1
+                                    print(f"[corrupt-tp-grad-distribution] ✓ Modified {name}.grad distribution", flush=True)
+                                    break
+                        if injected_count > 0:
+                            break
+                    print(f"[corrupt-tp-grad-distribution] ✓ Injection completed: {injected_count} grads modified", flush=True)
+            else:
+                print(f"[corrupt-tp-grad-distribution] ✗ Conditions not met", flush=True)
     
     except Exception as e:
         print(f"[corrupt-tp-after-bwd] ✗ Exception: {e}", flush=True)

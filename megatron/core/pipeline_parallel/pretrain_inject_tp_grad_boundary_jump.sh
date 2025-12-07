@@ -42,9 +42,7 @@ echo ""
 
 cd ${MEGATRON_ROOT}
 
-DATA_PATH="/volume/qscai/dataset/gpt2/my-gpt2_text_document"
-VOCAB_FILE="/volume/qscai/dataset/gpt2/gpt2-vocab.json"
-MERGE_FILE="/volume/qscai/dataset/gpt2/gpt2-merges.txt"
+# 使用 mock-data 模式，不需要真实数据集
 
 echo "开始训练（TP=2）..."
 
@@ -68,10 +66,8 @@ python -m torch.distributed.run \
     --log-interval 1 \
     --eval-iters 10 \
     --eval-interval 100 \
-    --data-path ${DATA_PATH} \
-    --vocab-file ${VOCAB_FILE} \
-    --merge-file ${MERGE_FILE} \
-    --split 949,50,1 \
+    --mock-data \
+    --vocab-size 50304 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
