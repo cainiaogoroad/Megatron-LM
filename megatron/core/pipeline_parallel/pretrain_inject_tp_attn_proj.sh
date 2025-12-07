@@ -139,7 +139,7 @@ for db_file in db_files:
     ''').fetchall()
     print(f"  linear_proj 参数: {[r[0] for r in params_result]}")
     
-    # 使用更宽松的查询
+    # 查询 model-after-backward 阶段的参数 cksum（不是梯度！）
     result = conn.execute('''
         SELECT
             step,
@@ -148,14 +148,26 @@ for db_file in db_files:
             json_extract(data, '$.cksum') as cksum
         FROM coredump
         WHERE json_extract_string(data, '$.name') LIKE '%linear_proj%weight%'
+        AND stage = 'model-after-backward'
         AND step = 2
         ORDER BY name
-        LIMIT 10
+        LIMIT 20
     ''').fetchall()
     
-    print(f"  linear_proj.weight 参数 (step=2):")
+    print(f"  linear_proj.weight 参数 (step=2, stage=model-after-backward):")
     if not result:
-        print(f"    ⚠️  未找到数据")
+        print(f"    ⚠️  未找到 model-after-backward 数据")
+        # 尝试 model-before-backward
+        result = conn.execute('''
+            SELECT step, stage, json_extract(data, '$.name') as name, json_extract(data, '$.cksum') as cksum
+            FROM coredump
+            WHERE json_extract_string(data, '$.name') LIKE '%linear_proj%weight%'
+            AND stage = 'model-before-backward'
+            AND step = 2
+            ORDER BY name LIMIT 20
+        ''').fetchall()
+        print(f"  尝试 model-before-backward:")
+    
     for row in result:
         step, stage, name, cksum = row
         print(f"    stage={stage}, name={name}, cksum={cksum}")
