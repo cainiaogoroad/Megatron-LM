@@ -14,6 +14,9 @@ export MEGATRON_ROOT="/volume/qscai/lsk/Megatron-LM"
 export VTIMELINE_ROOT="/volume/qscai/lsk/VTimeline"
 export PYTHONPATH="${VTIMELINE_ROOT}/src:${MEGATRON_ROOT}:${PYTHONPATH}"
 
+# TP 必需的环境变量
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 # 数据库输出目录
 export VTIMELINE_LOGGER_DIR="${MEGATRON_ROOT}/tp_layernorm_test_db"
 rm -rf "${VTIMELINE_LOGGER_DIR}"
@@ -110,8 +113,8 @@ echo ""
 echo "--- LayerNorm 注入日志 ---"
 grep -E "\[corrupt-tp-layernorm\]" ${VTIMELINE_LOGGER_DIR}/training.log | head -30
 
-INJECT_COUNT=$(grep -c "\[corrupt-tp-layernorm\] ✓ Modified" ${VTIMELINE_LOGGER_DIR}/training.log 2>/dev/null || echo "0")
-if [ "${INJECT_COUNT}" -gt 0 ]; then
+INJECT_COUNT=$(grep -c "\[corrupt-tp-layernorm\] ✓ Modified" ${VTIMELINE_LOGGER_DIR}/training.log 2>/dev/null) || INJECT_COUNT=0
+if [ "${INJECT_COUNT}" -gt 0 ] 2>/dev/null; then
     echo ""
     echo "✓ 检测到 ${INJECT_COUNT} 次成功注入"
 fi

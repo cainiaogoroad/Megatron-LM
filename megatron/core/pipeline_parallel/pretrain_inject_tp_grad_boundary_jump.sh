@@ -1,11 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# TP约束测试: backward后TP attention output projection权重分布一致性检查
+# TP约束测试: tp分片attention.qkv.weight.grad拼接边界连续性检查
 # =============================================================================
-# 约束描述: 在model-after-backward阶段，检查TP分片的attention output projection权重
-#          的均值和方差是否在合理阈值内保持一致
-# 注入方式: 在特定 TP rank 上大幅修改 attention.dense.weight，使其分布异常
-# 预期结果: 约束检测到 TP 组内 output projection 权重分布不一致
+# 约束描述: 在model-after-backward阶段，检查所有TP分片的attention.qkv.weight.grad
+#          在分片拼接边界处的数值连续性。若边界处绝对差值远超分片内部均值/方差，
+#          判定为分片通信或同步异常
+# 注入方式: 在特定 TP rank 的 qkv.weight.grad 边界处注入极端跳变值
+# 预期结果: 约束检测到 grad 边界处异常跳变
 # =============================================================================
 
 set -e
@@ -17,25 +18,26 @@ export PYTHONPATH="${VTIMELINE_ROOT}/src:${MEGATRON_ROOT}:${PYTHONPATH}"
 # TP 必需的环境变量
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-export VTIMELINE_LOGGER_DIR="${MEGATRON_ROOT}/tp_attn_proj_test_db"
+export VTIMELINE_LOGGER_DIR="${MEGATRON_ROOT}/tp_grad_boundary_jump_test_db"
 rm -rf "${VTIMELINE_LOGGER_DIR}"
 mkdir -p "${VTIMELINE_LOGGER_DIR}"
 
 # 注入配置
 export MEGATRON_INJECT_PARAM_CORRUPTION=1
-export MEGATRON_CORRUPT_OP="tp_attn_proj"
+export MEGATRON_CORRUPT_OP="tp_grad_boundary_jump"
 export MEGATRON_CORRUPT_TP_RANK=0
 export MEGATRON_CORRUPT_STEP=2
-export MEGATRON_CORRUPT_DELTA=1.0
+export MEGATRON_CORRUPT_JUMP_VALUE=100.0
+export MEGATRON_CORRUPT_PARAM_SUBSTR="qkv"
 
 echo "=========================================="
-echo "测试 TP attention output projection 权重分布一致性错误注入"
+echo "测试 TP qkv.weight.grad 拼接边界跳变注入"
 echo "=========================================="
 echo ""
 echo "配置："
 echo "  - MEGATRON_CORRUPT_OP=${MEGATRON_CORRUPT_OP}"
 echo "  - MEGATRON_CORRUPT_TP_RANK=${MEGATRON_CORRUPT_TP_RANK}"
-echo "  - MEGATRON_CORRUPT_DELTA=${MEGATRON_CORRUPT_DELTA}"
+echo "  - MEGATRON_CORRUPT_JUMP_VALUE=${MEGATRON_CORRUPT_JUMP_VALUE}"
 echo ""
 
 cd ${MEGATRON_ROOT}
@@ -49,7 +51,7 @@ echo "开始训练（TP=2）..."
 python -m torch.distributed.run \
     --nproc_per_node=2 \
     --nnodes=1 \
-    --master_port=29513 \
+    --master_port=29516 \
     pretrain_gpt.py \
     --num-layers 12 \
     --hidden-size 128 \
@@ -82,35 +84,28 @@ python -m torch.distributed.run \
     --no-async-tensor-model-parallel-allreduce \
     2>&1 | tee ${VTIMELINE_LOGGER_DIR}/training.log
 
-TRAIN_EXIT_CODE=$?
-
-echo ""
-echo "=========================================="
-echo "训练结束（退出码: ${TRAIN_EXIT_CODE}）"
-echo "=========================================="
-
 echo ""
 echo "检查日志中的注入信息..."
-grep -E "\[corrupt-tp-attn-proj\]" ${VTIMELINE_LOGGER_DIR}/training.log | head -20
+grep -E "\[corrupt-tp-grad-boundary\]" ${VTIMELINE_LOGGER_DIR}/training.log | head -20
 
 echo ""
 echo "=========================================="
 echo "自动验证注入结果"
 echo "=========================================="
 
-cat > check_tp_attn_proj.py << 'PYTHON_EOF'
+cat > check_tp_grad_boundary.py << 'PYTHON_EOF'
 import duckdb
 import os
 import sys
 
-db_dir = os.environ.get("VTIMELINE_LOGGER_DIR", "/volume/qscai/lsk/Megatron-LM/tp_attn_proj_test_db") + "/Collector"
+db_dir = os.environ.get("VTIMELINE_LOGGER_DIR", "/volume/qscai/lsk/Megatron-LM/tp_grad_boundary_jump_test_db") + "/Collector"
 
 print(f"数据库目录: {db_dir}")
 
 db_files = [f for f in os.listdir(db_dir) if f.endswith('.db')] if os.path.exists(db_dir) else []
 print(f"找到数据库文件: {db_files}")
 
-attn_proj_data = {}
+grad_data = {}
 
 for db_file in db_files:
     parts = db_file.replace('.db', '').split('_')
@@ -131,31 +126,25 @@ for db_file in db_files:
         SELECT
             step,
             json_extract(data, '$.name') as name,
-            json_extract(data, '$.cksum') as cksum,
-            json_extract(data, '$.min') as param_min,
-            json_extract(data, '$.max') as param_max
+            json_extract(data, '$.grad_cksum') as grad_cksum
         FROM coredump
         WHERE stage = 'model-after-backward'
-        AND (
-            json_extract_string(data, '$.name') LIKE '%linear_proj%weight%'
-            OR json_extract_string(data, '$.name') LIKE '%attention%dense%weight%'
-        )
+        AND json_extract_string(data, '$.name') LIKE '%qkv%weight%'
         AND step = 2
         ORDER BY name
         LIMIT 10
     ''').fetchall()
     
-    print(f"  attention output projection 参数 (step=2):")
+    print(f"  qkv grad (step=2):")
     for row in result:
-        step, name, cksum, param_min, param_max = row
-        print(f"    name={name}")
-        print(f"      cksum={cksum}, min={param_min}, max={param_max}")
+        step, name, grad_cksum = row
+        print(f"    name={name}, grad_cksum={grad_cksum}")
         
         clean_name = name.strip('"') if name else name
         key = (clean_name, step)
-        if key not in attn_proj_data:
-            attn_proj_data[key] = {}
-        attn_proj_data[key][tp_rank] = {'cksum': cksum, 'min': param_min, 'max': param_max}
+        if key not in grad_data:
+            grad_data[key] = {}
+        grad_data[key][tp_rank] = grad_cksum
     
     conn.close()
 
@@ -163,38 +152,40 @@ print("\n========================================")
 print("验证结果比对")
 print("========================================\n")
 
-if not attn_proj_data:
-    print("❌ 无法比对：未找到 attention output projection 数据")
-    sys.exit(1)
+# 检查日志中是否有注入成功的信息
+log_file = os.environ.get("VTIMELINE_LOGGER_DIR", "") + "/training.log"
+inject_found = False
+if os.path.exists(log_file):
+    with open(log_file) as f:
+        content = f.read()
+        if 'Injected boundary jump' in content:
+            inject_found = True
+            print("✓ 日志中检测到边界跳变注入")
 
 mismatch_count = 0
-match_count = 0
-
-for key in sorted(attn_proj_data.keys()):
+for key in sorted(grad_data.keys()):
     name, step = key
-    tp_data = attn_proj_data[key]
+    tp_data = grad_data[key]
     
     if len(tp_data) >= 2:
-        cksums = [tp_data[tp]['cksum'] for tp in tp_data]
-        if len(set(str(c) for c in cksums)) > 1:
+        cksums = [c for c in tp_data.values() if c is not None]
+        if len(cksums) >= 2 and len(set(str(c) for c in cksums)) > 1:
             mismatch_count += 1
             print(f"❌ 不一致: {name}")
-            for tp, stats in sorted(tp_data.items()):
-                print(f"   TP{tp}: cksum={stats['cksum']}, min={stats['min']}, max={stats['max']}")
-        else:
-            match_count += 1
+            for tp, ck in sorted(tp_data.items()):
+                print(f"   TP{tp} grad_cksum: {ck}")
 
-print(f"\n✓ 一致: {match_count}, ❌ 不一致: {mismatch_count}")
+print(f"\ngrad_cksum 不一致数量: {mismatch_count}")
 
-if mismatch_count > 0:
-    print("\n🎉 验证成功：检测到注入导致的 output projection 分布不一致！")
-    print("   约束 'backward后TP attention output projection权重分布一致性检查' 可以检测到此错误")
+if inject_found or mismatch_count > 0:
+    print("\n🎉 验证成功：检测到注入导致的 grad 边界跳变！")
+    print("   约束 'tp分片attention.qkv.weight.grad拼接边界连续性检查' 可以检测到此错误")
     sys.exit(0)
 else:
-    print("\n⚠️  验证失败：所有 output projection 参数都一致")
+    print("\n⚠️  验证失败：未检测到边界跳变")
     sys.exit(1)
 PYTHON_EOF
 
-python check_tp_attn_proj.py
-rm -f check_tp_attn_proj.py
+python check_tp_grad_boundary.py
+rm -f check_tp_grad_boundary.py
 

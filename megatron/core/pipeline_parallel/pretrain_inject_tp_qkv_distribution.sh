@@ -14,6 +14,9 @@ export MEGATRON_ROOT="/volume/qscai/lsk/Megatron-LM"
 export VTIMELINE_ROOT="/volume/qscai/lsk/VTimeline"
 export PYTHONPATH="${VTIMELINE_ROOT}/src:${MEGATRON_ROOT}:${PYTHONPATH}"
 
+# TP 必需的环境变量
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 export VTIMELINE_LOGGER_DIR="${MEGATRON_ROOT}/tp_qkv_distribution_test_db"
 rm -rf "${VTIMELINE_LOGGER_DIR}"
 mkdir -p "${VTIMELINE_LOGGER_DIR}"

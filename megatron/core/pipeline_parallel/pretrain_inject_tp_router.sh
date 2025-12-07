@@ -14,6 +14,9 @@ export MEGATRON_ROOT="/volume/qscai/lsk/Megatron-LM"
 export VTIMELINE_ROOT="/volume/qscai/lsk/VTimeline"
 export PYTHONPATH="${VTIMELINE_ROOT}/src:${MEGATRON_ROOT}:${PYTHONPATH}"
 
+# TP 必需的环境变量
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 export VTIMELINE_LOGGER_DIR="${MEGATRON_ROOT}/tp_router_test_db"
 rm -rf "${VTIMELINE_LOGGER_DIR}"
 mkdir -p "${VTIMELINE_LOGGER_DIR}"
@@ -92,8 +95,8 @@ echo ""
 echo "检查日志中的注入信息..."
 grep -E "\[corrupt-tp-router\]" ${VTIMELINE_LOGGER_DIR}/training.log | head -20
 
-INJECT_COUNT=$(grep -c "\[corrupt-tp-router\] ✓ Modified" ${VTIMELINE_LOGGER_DIR}/training.log 2>/dev/null || echo "0")
-if [ "${INJECT_COUNT}" -gt 0 ]; then
+INJECT_COUNT=$(grep -c "\[corrupt-tp-router\] ✓ Modified" ${VTIMELINE_LOGGER_DIR}/training.log 2>/dev/null) || INJECT_COUNT=0
+if [ "${INJECT_COUNT}" -gt 0 ] 2>/dev/null; then
     echo "✓ 检测到 ${INJECT_COUNT} 次成功注入"
 else
     echo "⚠️  未检测到 Router 参数注入 - 模型可能不包含 Router/Gate 参数"
